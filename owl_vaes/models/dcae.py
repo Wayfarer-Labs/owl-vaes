@@ -63,7 +63,7 @@ class Encoder(nn.Module):
         return x
 
 class Decoder(nn.Module):
-    def __init__(self, config : ResNetConfig):
+    def __init__(self, config: ResNetConfig):
         super().__init__()
 
         size = config.sample_size
@@ -120,7 +120,7 @@ class DCAE(nn.Module):
     """
     DCAE based autoencoder that takes a ResNetConfig to configure.
     """
-    def __init__(self, config : ResNetConfig):
+    def __init__(self, config: ResNetConfig):
         super().__init__()
 
         self.encoder = Encoder(config)
