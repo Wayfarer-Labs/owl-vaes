@@ -14,6 +14,7 @@ from ..models import get_model_cls
 from ..discriminators import get_discriminator_cls
 from ..muon import init_muon
 from ..nn.lpips import VGGLPIPS
+from ..nn.realtivistic_loss import gan_loss_with_approximate_penalties
 from ..schedulers import get_scheduler_cls
 from ..utils import Timer, freeze, unfreeze, versatile_load
 from ..utils.get_device import DeviceManager
@@ -193,7 +194,7 @@ class DecTunerainer(BaseTrainer):
                 # Discriminator training 
                 unfreeze(self.discriminator)
                 with ctx:
-                    disc_loss = self.discriminator(batch_rec.detach(), batch.detach()) / accum_steps
+                    disc_loss = gan_loss_with_approximate_penalties(self.discriminator, batch.detach(), batch_rec.detach(), discriminator_turn=True) / accum_steps
                 metrics.log('disc_loss', disc_loss)
                 self.scaler.scale(disc_loss).backward()
                 freeze(self.discriminator)
@@ -210,7 +211,7 @@ class DecTunerainer(BaseTrainer):
                 
                 crnt_gan_weight = warmup_gan_weight()
                 if crnt_gan_weight > 0.0:
-                    gan_loss = self.discriminator(batch_rec) / accum_steps
+                    gan_loss = gan_loss_with_approximate_penalties(self.discriminator, batch.detach(), batch_rec, discriminator_turn=False) / accum_steps
                     metrics.log('gan_loss', gan_loss)
                     total_loss += crnt_gan_weight * gan_loss
 
