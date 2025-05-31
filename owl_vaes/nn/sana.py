@@ -4,8 +4,10 @@ import torch.nn.functional as F
 
 import einops as eo
 
-from .attn import Attn
+from ..nn.normalization import LayerNorm
 from ..configs import TransformerConfig
+
+from .attn import Attn
 
 """
 Building blocks for SANA modules and residuals

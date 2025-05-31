@@ -18,8 +18,8 @@ from ..schedulers import get_scheduler_cls
 from ..utils import Timer, freeze, unfreeze, versatile_load
 from ..utils.get_device import DeviceManager
 from ..utils.logging import LogHelper, to_wandb
-from .base import BaseTrainer
 from ..configs import Config
+from .base import BaseTrainer
 
 device = DeviceManager.get_device()
 

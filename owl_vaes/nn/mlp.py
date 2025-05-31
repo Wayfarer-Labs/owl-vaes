@@ -1,8 +1,10 @@
 from torch import nn
 import torch.nn.functional as F
 
+from ..configs import TransformerConfig
+
 class MLP(nn.Module):
-    def __init__(self, config : 'TransformerConfig'):
+    def __init__(self, config : TransformerConfig):
         super().__init__()
 
         self.fc1 = nn.Linear(config.d_model, 4 * config.d_model)

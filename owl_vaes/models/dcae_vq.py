@@ -1,6 +1,5 @@
-
-from .dcae import DCAE
 from ..nn.lfq import LFQModule
+from .dcae import DCAE
 
 class DCVQVAE(DCAE):
     def __init__(self, *args, **kwargs):

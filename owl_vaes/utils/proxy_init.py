@@ -6,8 +6,7 @@ Hard-coded for Proxy TiToK + DCAE for now
 import torch
 from torch import nn
 
-from owl_vaes.utils.get_device import DeviceManager
-
+from ..utils.get_device import DeviceManager
 from ..configs import Config
 from ..models.dcae import Decoder
 from ..models.proxy_titok import ProxyTiToKVAE

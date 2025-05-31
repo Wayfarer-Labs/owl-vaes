@@ -1,6 +1,5 @@
-
-from .titok import TiToKVAE
 from ..nn.lfq import LFQModule
+from .titok import TiToKVAE
 
 class TiToKVQVAE(TiToKVAE):
     def __init__(self, *args, **kwargs):

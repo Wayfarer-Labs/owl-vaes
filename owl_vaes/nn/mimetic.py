@@ -1,6 +1,8 @@
 import torch
 from torch import nn
 
+from ..configs import TransformerConfig
+
 def posemb_sincos_2d(patches, temperature = 10000, dtype = torch.float32, s=1.0):
     _, h, w, dim, device, dtype = *patches.shape, patches.device, patches.dtype
 
@@ -26,7 +28,7 @@ def get_ortho_like(dim, heads, alpha, beta, sign=1, dist='uniform'):
     R = torch.diag(torch.sqrt(S)) @ V
     return L, R
 
-def mimetic_init(qkv : nn.Linear, out : nn.Linear, config : 'TransformerConfig'):
+def mimetic_init(qkv : nn.Linear, out : nn.Linear, config : TransformerConfig):
     dim = config.d_model
     head_dim = config.d_model // config.n_heads
 

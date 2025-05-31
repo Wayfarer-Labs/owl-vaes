@@ -3,8 +3,10 @@ from torch import nn
 
 import einops as eo
 
+from ..configs import TransformerConfig
+
 class ImageRoPE(nn.Module):
-    def __init__(self, config : 'TransformerConfig'):
+    def __init__(self, config : TransformerConfig):
         super().__init__()
 
         pass

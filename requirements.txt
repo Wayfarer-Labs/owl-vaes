@@ -10,3 +10,4 @@ wandb
 kornia
 datasets
 huggingface-hub
+torchtyping

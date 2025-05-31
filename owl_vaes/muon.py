@@ -4,7 +4,7 @@ from torch import Tensor
 from torch.optim import AdamW
 from torch.optim.optimizer import Optimizer
 
-from owl_vaes.utils.get_device import DeviceManager
+from .utils.get_device import DeviceManager
 
 device = DeviceManager.get_device()
 
