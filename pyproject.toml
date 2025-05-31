@@ -17,7 +17,7 @@ dependencies = [
     "kornia",
     "datasets",
     "huggingface-hub",
-    "muon",
+    "muon-optimizer",
     "lpips",
     "dotenv>=0.9.9",
     "torchtyping>=0.1.5",
@@ -32,5 +32,5 @@ dev = [
 ]
 
 [tool.uv.sources]
-muon = { git = "https://github.com/KellerJordan/Muon" }
+muon-optimizer = { git = "https://github.com/KellerJordan/Muon" }
 lpips = { git = "https://github.com/shahbuland/PerceptualSimilarity" }
