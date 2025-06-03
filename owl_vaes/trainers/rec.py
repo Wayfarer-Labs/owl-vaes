@@ -13,6 +13,7 @@ from ..data import get_loader
 from ..models import get_model_cls
 from ..muon import init_muon
 from ..nn.lpips import VGGLPIPS
+from ..nn.vicreg import VICRegLoss
 from ..schedulers import get_scheduler_cls
 from ..utils import Timer, freeze
 from ..utils.logging import LogHelper, to_wandb
@@ -41,6 +42,16 @@ class RecTrainer(BaseTrainer):
 
         model_id = self.model_cfg.model_id
         self.model = get_model_cls(model_id)(self.model_cfg)
+
+        var_coeff, cov_coeff, inv_coeff = (self.train_cfg.loss_weights.get('var_coeff', 0.0),
+                                          self.train_cfg.loss_weights.get('cov_coeff', 0.0),
+                                          self.train_cfg.loss_weights.get('inv_coeff', 0.0))        
+        # needs to be saved cause this adds parameters (projectors)
+        self.vicreg_loss = None
+        if var_coeff > 0.0 or cov_coeff > 0.0 or inv_coeff > 0.0:
+            self.vicreg_loss = VICRegLoss(var_coeff, cov_coeff,
+                                            inv_coeff = inv_coeff,
+                                            mlp_spec = self.model_cfg.mlp_spec)
 
         if self.rank == 0:
             param_count = sum(p.numel() for p in self.model.parameters())
@@ -165,6 +176,16 @@ class RecTrainer(BaseTrainer):
                         lpips_loss = lpips(batch_rec, batch) / accum_steps
                     total_loss += lpips_loss
                     metrics.log('lpips_loss', lpips_loss)
+
+                # vcreg 
+                if self.vicreg_loss is not None:
+                    with ctx:
+                        var_loss, cov_loss, inv_loss = self.vicreg_loss(z) # <-- this handles augmentations (if inv_loss is used) and projections
+                    total_loss += var_loss + cov_loss + inv_loss
+                    metrics.log('vicreg_sum_loss', var_loss + cov_loss + inv_loss)
+                    metrics.log('vicreg_var_loss', var_loss)
+                    metrics.log('vicreg_cov_loss', cov_loss)
+                    metrics.log('vicreg_inv_loss', inv_loss)
 
                 self.scaler.scale(total_loss).backward()
 

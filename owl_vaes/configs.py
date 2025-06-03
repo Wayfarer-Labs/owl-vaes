@@ -25,6 +25,10 @@ class VAEConfig:
     proxy_size : int = 16
     proxy_channels : int = 16
 
+    # For VICReg
+    mlp_spec  : str   = '8192-8192-8192'
+
+
 @dataclass
 class ResNetConfig(VAEConfig):
     ch_0 : int = 256
@@ -86,6 +90,7 @@ class TrainingConfig:
 
     # For distillation, if you want to renormalize latents, scale by this amount before decode
     latent_scale:float = 1.0
+
 
 @dataclass
 class WANDBConfig:
