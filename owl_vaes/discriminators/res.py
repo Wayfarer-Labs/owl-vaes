@@ -6,11 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from owl_vaes.utils.get_device import DeviceManager
-
 from ..nn.resnet import DownBlock, SameBlock
-
-device = DeviceManager.get_device()
 
 class R3GANDiscriminator(nn.Module):
     def __init__(self, config):

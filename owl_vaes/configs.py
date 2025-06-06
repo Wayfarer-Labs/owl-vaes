@@ -21,6 +21,10 @@ class VAEConfig:
     codebook_size : int = 1024
     codebook_dim : int = 8
 
+    # For proxy
+    proxy_size : int = 16
+    proxy_channels : int = 16
+
 @dataclass
 class ResNetConfig(VAEConfig):
     ch_0 : int = 256
@@ -41,10 +45,36 @@ class TransformerConfig(VAEConfig):
     causal: bool = False
     mimetic_init: bool = True
 
+    # Proxy stuff
+    proxy_patch_size : int = 1
+
+@dataclass
+class AudioConfig(VAEConfig):
+    in_channels: int = 2
+    out_channels: int = 2
+    channels: int = 128
+    latent_dim: int = 32
+
+    c_mults: list = None  # Channel multipliers per stage
+    strides: list = None  # Downsampling strides
+
+    use_snake: bool = False
+    antialias_activation: bool = False
+    use_nearest_upsample: bool = False
+    final_tanh: bool = True
+
+    def __post_init__(self):
+        if self.c_mults is None:
+            self.c_mults = [1, 2, 4, 8]
+        if self.strides is None:
+            self.strides = [2, 4, 8, 8]
+
+
 @dataclass
 class TrainingConfig:
     trainer_id : str = None
     data_id : str = None
+    filepath : str = None  # For audio data path
 
     target_batch_size : int = 128
     batch_size : int = 2
@@ -76,6 +106,9 @@ class TrainingConfig:
 
     # Causal regularization
     warmup_crt:int = 1000
+
+    # For distillation, if you want to renormalize latents, scale by this amount before decode
+    latent_scale:float = 1.0
 
 @dataclass
 class WANDBConfig:

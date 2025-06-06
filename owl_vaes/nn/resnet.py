@@ -1,7 +1,7 @@
 from torch import nn
 import torch.nn.functional as F
 
-from .normalization import RMSNorm2d
+from .normalization import RMSNorm2d, GroupNorm
 
 """
 Building blocks for any ResNet based model
@@ -21,10 +21,12 @@ class ResBlock(nn.Module):
         n_grps = (2*ch) // grp_size
 
         self.conv1 = nn.Conv2d(ch, 2*ch, 1, 1, 0)
+        #self.norm1 = RMSNorm2d(2*ch)
+        self.norm1 = GroupNorm(2*ch, n_grps)
 
-        self.norm1 = RMSNorm2d(2*ch)
         self.conv2 = nn.Conv2d(2*ch, 2*ch, 3, 1, 1, groups = n_grps)
-        self.norm2 = RMSNorm2d(2*ch)
+        #self.norm2 = RMSNorm2d(2*ch)
+        self.norm2 = GroupNorm(2*ch, n_grps)
 
         self.conv3 = nn.Conv2d(2*ch, ch, 1, 1, 0, bias=False)
 

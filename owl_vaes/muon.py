@@ -4,10 +4,6 @@ from torch import Tensor
 from torch.optim import AdamW
 from torch.optim.optimizer import Optimizer
 
-from .utils.get_device import DeviceManager
-
-device = DeviceManager.get_device()
-
 def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
@@ -49,7 +45,7 @@ class Muon(torch.optim.Optimizer):
         params: list[Tensor] = [*params]
         param_groups = []
         for size in {p.numel() for p in params}:
-            b = torch.empty(world_size, size, dtype=torch.bfloat16, device=device)
+            b = torch.empty(world_size, size, dtype=torch.bfloat16, device='cuda')
             group = dict(params=[p for p in params if p.numel() == size],
                          update_buffer=b, update_buffer_views=[b[i] for i in range(world_size)])
             param_groups.append(group)

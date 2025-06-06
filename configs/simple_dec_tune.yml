@@ -6,15 +6,22 @@ model:
   latent_size: 32
   latent_channels: 4
 
+  discriminator:
+    model_id: r3gan
+    ch_0: 32
+    ch_max: 128
+    sample_size: 256
+    blocks_per_stage: 1
+
   noise_decoder_inputs: 0.05
   ch_0: 32
   ch_max: 128
 
-  encoder_blocks_per_stage: [2, 2, 2, 2]
-  decoder_blocks_per_stage: [2, 2, 2, 2]
+  encoder_blocks_per_stage: [1, 1, 1, 1]
+  decoder_blocks_per_stage: [1, 1, 1, 1]
 
 train:
-  trainer_id: rec
+  trainer_id: dec_tune
   data_id: s3_imagenet
 
   target_batch_size: 32
@@ -27,10 +34,15 @@ train:
     lr: 5.0e-5
     eps: 1.0e-15
     betas: [0.9, 0.95]
+    weight_decay: 1.0e-4
 
   loss_weights:
     latent_reg: 1.0e-6
     lpips: 0.0
+    adv: 0.2
+
+  delay_adv: 0
+  warmup_adv: 500
 
   scheduler: LinearWarmup
   scheduler_kwargs:
@@ -41,6 +53,11 @@ train:
 
   sample_interval: 1000
   save_interval: 10000
+
+  teacher_ckpt: checkpoints/v0/step_10000.pt
+  teacher_cfg: configs/simple_16x.yml
+
+  latent_scale: 0.465
 
 wandb:
   name: ${env:WANDB_USER_NAME}

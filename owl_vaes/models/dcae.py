@@ -4,12 +4,9 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..configs import ResNetConfig
-from ..utils.get_device import DeviceManager
 from ..nn.normalization import GroupNorm
 from ..nn.resnet import DownBlock, SameBlock, UpBlock
 from ..nn.sana import ChannelToSpace, SpaceToChannel
-
-device = DeviceManager.get_device()
 
 class Encoder(nn.Module):
     def __init__(self, config: ResNetConfig):
@@ -142,16 +139,29 @@ class DCAE(nn.Module):
         down_rec = self.decoder(down_dec_input)
         return rec, z, down_rec
 
+def dcae_test():
+    from ..configs import ResNetConfig
+
+    cfg = ResNetConfig(
+        sample_size=256,
+        channels=3,
+        latent_size=32,
+        latent_channels=4,
+        noise_decoder_inputs=0.0,
+        ch_0=32,
+        ch_max=128,
+        encoder_blocks_per_stage = [2,2,2,2],
+        decoder_blocks_per_stage = [2,2,2,2]
+    )
+
+    model = DCAE(cfg).bfloat16().cuda()
+    with torch.no_grad():
+        x = torch.randn(1, 3, 256, 256).bfloat16().cuda()
+        rec, z, down_rec = model(x)
+        assert rec.shape == (1, 3, 256, 256), f"Expected shape (1,3,256,256), got {rec.shape}"
+        assert z.shape == (1, 4, 32, 32), f"Expected shape (1,4,32,32), got {z.shape}"
+        assert down_rec.shape == (1, 3, 128, 128), f"Expected shape (1,3,128,128), got {down_rec.shape}"
+    print("Test passed!")
+    
 if __name__ == "__main__":
-    from ..configs import Config
-
-    cfg = Config.from_yaml("configs/1d_diff_exps/teacher_1.yml").model
-    model = DCAE(cfg).float().to(device)
-
-    with torch.autocast(device, dtype=torch.bfloat16):
-        x = torch.randn(1, 3, 256, 256, device=device, dtype=torch.bfloat16)
-        rec, z, _ = model(x)
-
-        print(f'Input shape: {x.shape}, dtype: {x.dtype}')
-        print(f'Latent shape: {z.shape}, dtype: {z.dtype}')
-        print(f'Output shape: {rec.shape}, dtype: {rec.dtype}')
+    dcae_test()

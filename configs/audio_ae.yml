@@ -1,0 +1,59 @@
+model:
+  model_id: audio_ae
+
+  in_channels: 2
+  out_channels: 2
+  channels: 128
+  latent_dim: 32
+
+  c_mults: [1, 2, 4, 8]
+  strides: [2, 4, 8, 8]
+
+  use_snake: true
+  antialias_activation: true
+  use_nearest_upsample: true
+  final_tanh: true
+
+train:
+  trainer_id: audio_rec
+  data_id: audio_loader
+  filepath: "my_data/"
+
+  target_batch_size: 16
+  batch_size: 24
+  epochs: 100
+
+  opt: AdamW
+  opt_kwargs:
+    lr: 1.5e-4
+    eps: 1.0e-15
+    betas: [0.9, 0.98]
+    weight_decay: 1.0e-4
+
+  loss_weights:
+    recon: 2.5
+    stft: 1.5
+    kl: 2.5e-4
+    lr_ms_ratio: 0.5
+    hubert: 0.0
+
+  sample_rate: 44100
+  n_fft_list: [1024, 2048, 512]
+
+  scheduler: LinearWarmup
+  scheduler_kwargs:
+    warmup_steps: 1500
+    min_lr: 2.0e-6
+
+  checkpoint_dir: checkpoints/audio_ae
+  sample_interval: 500
+  save_interval: 5000
+
+  resume_ckpt: null
+
+wandb:
+  name: ${env:WANDB_USER_NAME}
+  project: owl_audio_vaes
+  run_name: audio_ae_baseline
+
+  notes: "First attempt AE run."

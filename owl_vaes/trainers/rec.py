@@ -15,11 +15,8 @@ from ..muon import init_muon
 from ..nn.lpips import VGGLPIPS
 from ..schedulers import get_scheduler_cls
 from ..utils import Timer, freeze
-from ..utils.get_device import DeviceManager
 from ..utils.logging import LogHelper, to_wandb
 from .base import BaseTrainer
-
-device = DeviceManager.get_device()
 
 def latent_reg_loss(z):
     # z is [b,c,h,w]
@@ -81,19 +78,21 @@ class RecTrainer(BaseTrainer):
         self.total_step_counter = save_dict['steps']
 
     def train(self):
+        torch.cuda.set_device(self.local_rank)
+
         # Loss weights
         reg_weight =  self.train_cfg.loss_weights.get('latent_reg', 0.0)
         lpips_weight = self.train_cfg.loss_weights.get('lpips', 0.0)
         se_reg_weight = self.train_cfg.loss_weights.get('se_reg', 0.0)
 
         # Prepare model, lpips, ema
-        self.model = self.model.to(device).train()
+        self.model = self.model.cuda().train()
         if self.world_size > 1:
             self.model = DDP(self.model)
 
         lpips = None
         if lpips_weight > 0.0:
-            lpips = VGGLPIPS().to(device).eval()
+            lpips = VGGLPIPS().cuda().eval()
             freeze(lpips)
 
         self.ema = EMA(
@@ -116,7 +115,7 @@ class RecTrainer(BaseTrainer):
         accum_steps = self.train_cfg.target_batch_size // self.train_cfg.batch_size // self.world_size
         accum_steps = max(1, accum_steps)
         self.scaler = torch.amp.GradScaler()
-        ctx = torch.amp.autocast(device, torch.bfloat16)
+        ctx = torch.amp.autocast(f'cuda:{self.local_rank}', torch.bfloat16)
 
         # Timer reset
         timer = Timer()
@@ -132,7 +131,7 @@ class RecTrainer(BaseTrainer):
         for _ in range(self.train_cfg.epochs):
             for batch in loader:
                 total_loss = 0.
-                batch = batch.to(device).bfloat16()
+                batch = batch.to('cuda').bfloat16()
 
                 with ctx:
                     out = self.model(batch)

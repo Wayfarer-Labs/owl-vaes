@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "VAEs for Open World Labs"
 readme = "README.md"
 requires-python = ">=3.13"
+
 dependencies = [
     "jupyter>=1.1.1",
     "ray>=2.46.0",
@@ -18,19 +19,30 @@ dependencies = [
     "datasets",
     "huggingface-hub",
     "muon",
-    "lpips",
     "dotenv>=0.9.9",
     "torchtyping>=0.1.5",
     "pre-commit>=4.2.0",
+    "torchaudio>=2.7.0",
+    "soundfile>=0.13.1",
+    "alias-free-torch>=0.0.6",
+    "torchvision>=0.22.0",
+    "lpips>=0.1.4",
 ]
+
+[tool.setuptools.packages.find]
+include = ["owl_vaes*"]
 
 [dependency-groups]
 dev = [
     "basedpyright>=1.29.2",
+    "owl-vae",
     "pdbpp>=0.11.6",
+    "pylsp-rope>=0.1.17",
+    "python-lsp-server>=1.12.2",
     "ruff>=0.11.11",
+    "skypilot[runpod]>=0.9.3",
 ]
 
 [tool.uv.sources]
-muon = { git = "https://github.com/KellerJordan/Muon" }
 lpips = { git = "https://github.com/shahbuland/PerceptualSimilarity" }
+owl-vae = { workspace = true }

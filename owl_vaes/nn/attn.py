@@ -10,11 +10,7 @@ from .mimetic import mimetic_init
 from .mlp import MLP
 from .normalization import LayerNorm, QKNorm
 
-device = DeviceManager.get_device()
-
-if device == "cuda":
-    torch.backends.cuda.enable_flash_sdp(enabled=True)
-
+torch.backends.cuda.enable_flash_sdp(enabled=True)
 
 class Attn(nn.Module):
     def __init__(self, config : TransformerConfig):
@@ -114,10 +110,56 @@ class PatchProjOut(nn.Module):
 
         return x
 
-if __name__ == "__main__":
-    layer = PatchProjOut(64, 384, 3, 4).to(device).bfloat16()
-    x = torch.randn(1,256,384).to(device).bfloat16()
+def attn_test():
+    cfg = TransformerConfig(
+        sample_size = 16,
+        channels = 32,
+        latent_size = 16,
+        latent_channels = 128,
+        n_layers = 6,
+        n_heads = 6,
+        d_model = 384,
+        patch_size = 1,
+        causal = False,
+        mimetic_init = False
+    )
 
+    # Test Attention layer
+    attn = Attn(cfg).bfloat16().cuda()
     with torch.no_grad():
-        z = layer(x)
-        print(z.shape)
+        x = torch.randn(1, 256, 384).bfloat16().cuda()
+        y = attn(x)
+        assert y.shape == (1, 256, 384), f"Expected shape (1,256,384), got {y.shape}"
+
+    # Test Transformer layer
+    transformer = Transformer(cfg).bfloat16().cuda()
+    with torch.no_grad():
+        x = torch.randn(1, 256, 384).bfloat16().cuda()
+        y = transformer(x)
+        assert y.shape == (1, 256, 384), f"Expected shape (1,256,384), got {y.shape}"
+
+    # Test StackedTransformer
+    stacked = StackedTransformer(cfg).bfloat16().cuda()
+    with torch.no_grad():
+        x = torch.randn(1, 256, 384).bfloat16().cuda()
+        y = stacked(x)
+        assert y.shape == (1, 256, 384), f"Expected shape (1,256,384), got {y.shape}"
+
+    # Test PatchProjIn
+    patch_in = PatchProjIn(384, 32, 1).bfloat16().cuda()
+    with torch.no_grad():
+        x = torch.randn(1, 32, 16, 16).bfloat16().cuda()
+        y = patch_in(x)
+        assert y.shape == (1, 256, 384), f"Expected shape (1,256,384), got {y.shape}"
+
+    # Test PatchProjOut
+    patch_out = PatchProjOut(16, 384, 32, 1).bfloat16().cuda()
+    with torch.no_grad():
+        x = torch.randn(1, 256, 384).bfloat16().cuda()
+        y = patch_out(x)
+        assert y.shape == (1, 32, 16, 16), f"Expected shape (1,32,16,16), got {y.shape}"
+
+    print("All Tests Passed!")
+    
+if __name__ == "__main__":
+    attn_test()

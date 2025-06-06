@@ -9,8 +9,6 @@ from ..utils.get_device import DeviceManager
 from ..nn.attn import PatchProjIn, PatchProjOut, StackedTransformer
 from ..nn.embeddings import LearnedPosEnc
 
-device = DeviceManager.get_device()
-
 class Encoder(nn.Module):
     def __init__(self, config : 'TransformerConfig'):
         super().__init__()
@@ -92,26 +90,31 @@ class ProxyTiToKVAE(nn.Module):
         rec = self.decoder(dec_input)
         return rec, z
 
-if __name__ == "__main__":
+def proxy_titok_test():
     from ..configs import TransformerConfig
 
     cfg = TransformerConfig(
-        sample_size = 16,
-        channels = 32,
+        sample_size = 256,
+        channels = 3,
         latent_size = 16,
         latent_channels = 128,
         n_layers = 6,
         n_heads = 6,
         d_model = 384,
-        patch_size = 1
+        patch_size = 16,
+        proxy_patch_size = 1,
+        proxy_size = 16,
+        proxy_channels = 32
     )
 
-    model = TiToKVAE(cfg).float().to(device)
-
-    with torch.autocast(dtype=torch.bfloat16):
-        x = torch.randn(1, 32, 16, 16, device=device, dtype=torch.bfloat16)
+    model = ProxyTiToKVAE(cfg).bfloat16().cuda()
+    with torch.no_grad():
+        x = torch.randn(1, 3, 256, 256).bfloat16().cuda()
         rec, z = model(x)
+        assert rec.shape == (1, 32, 16, 16), f"Expected shape (1,32,16,16), got {rec.shape}"
+        assert z.shape == (1, 16, 128), f"Expected shape (1,16,128), got {z.shape}"
 
-        print(f'Input shape: {x.shape}, dtype: {x.dtype}')
-        print(f'Latent shape: {z.shape}, dtype: {z.dtype}')
-        print(f'Output shape: {rec.shape}, dtype: {rec.dtype}')
+    print("Test passed!")
+    
+if __name__ == "__main__":
+    proxy_titok_test()

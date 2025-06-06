@@ -3,20 +3,20 @@ model:
   model_id: proxy_titok
   sample_size: 256
   channels: 3
-  latent_size: 16
-  latent_channels: 128
+  latent_size: 32
+  latent_channels: 16
 
-  proxy_size: 16
-  proxy_channels: 16
+  proxy_size: 32
+  proxy_channels: 4
 
-  noise_decoder_inputs: 0.0
+  noise_decoder_inputs: 0.05
 
-  n_layers: 24
-  n_heads: 16
-  d_model: 1024
+  n_layers: 12
+  n_heads: 6
+  d_model: 384
 
   patch_size: 16
-  proxy_patch_size: 1
+  proxy_patch_size: 2
 
   mimetic_init: false
   causal: false
@@ -62,8 +62,8 @@ train:
   sample_interval: 1000
   save_interval: 10000
 
-  teacher_ckpt: checkpoints/vae_16x_c16_100k_ckpt.pt
-  teacher_cfg: configs/1d_diff_exps/teacher_1.yml
+  teacher_ckpt: checkpoints/v0/step_10000.pt
+  teacher_cfg: configs/simple_16x.yml
 
 wandb:
   name: ${env:WANDB_USER_NAME}

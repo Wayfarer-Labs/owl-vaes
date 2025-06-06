@@ -9,8 +9,6 @@ import wandb
 from ema_pytorch import EMA
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from owl_vaes.utils.get_device import DeviceManager
-
 from ..configs import Config
 from ..data import get_loader
 from ..models import get_model_cls
@@ -19,8 +17,6 @@ from ..schedulers import get_scheduler_cls
 from ..utils import Timer, versatile_load
 from ..utils.logging import LogHelper, to_wandb
 from .base import BaseTrainer
-
-device = DeviceManager.get_device()
 
 def latent_reg_loss(z):
     # z is [b,c,h,w]
@@ -92,15 +88,17 @@ class ProxyTrainer(BaseTrainer):
         self.total_step_counter = save_dict['steps']
 
     def train(self):
+        torch.cuda.set_device(self.local_rank)
+
         # Loss weights
         reg_weight =  self.train_cfg.loss_weights.get('latent_reg', 0.0)
 
         # Prepare model, lpips, ema
-        self.model = self.model.to(device).train()
+        self.model = self.model.cuda().train()
         if self.world_size > 1:
             self.model = DDP(self.model, device_ids=[self.local_rank])
 
-        self.teacher = self.teacher.eval().to(device).bfloat16()
+        self.teacher = self.teacher.eval().cuda().bfloat16()
         self.teacher.encoder = torch.compile(self.teacher.encoder)
 
         self.ema = EMA(
@@ -123,7 +121,7 @@ class ProxyTrainer(BaseTrainer):
         accum_steps = self.train_cfg.target_batch_size // self.train_cfg.batch_size
         accum_steps = max(1, accum_steps)
         self.scaler = torch.amp.GradScaler()
-        ctx = torch.amp.autocast(device,torch.bfloat16)
+        ctx = torch.amp.autocast(f'cuda:{self.local_rank}',torch.bfloat16)
 
         # Timer reset
         timer = Timer()
@@ -139,7 +137,7 @@ class ProxyTrainer(BaseTrainer):
         for _ in range(self.train_cfg.epochs):
             for batch in loader:
                 total_loss = 0.
-                batch = batch.to(device).bfloat16()
+                batch = batch.to('cuda').bfloat16()
 
                 with ctx:
                     batch_rec, z = self.model(batch)

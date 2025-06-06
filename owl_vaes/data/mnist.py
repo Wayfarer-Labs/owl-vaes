@@ -5,10 +5,6 @@ from datasets import load_dataset
 from PIL import Image
 from torch.utils.data import DataLoader
 
-from owl_vaes.utils.get_device import DeviceManager
-
-device = DeviceManager.get_device()
-
 def get_loader(batch_size):
 
     """Get MNIST data loader
@@ -57,7 +53,7 @@ def get_loader(batch_size):
         sampler=train_sampler,
         drop_last=True,
         collate_fn=collate_fn,
-        generator=torch.Generator(device)
+        generator=torch.Generator('cuda')
     )
 
     return train_loader

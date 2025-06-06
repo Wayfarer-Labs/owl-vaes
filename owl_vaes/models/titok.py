@@ -3,13 +3,10 @@ from typing import Tuple
 import einops as eo
 import torch
 from torch import nn
-from torchtyping import TensorType
+from torch import Tensor
 
-from ..utils.get_device import DeviceManager
 from ..nn.attn import PatchProjIn, PatchProjOut, StackedTransformer
 from ..nn.embeddings import LearnedPosEnc
-
-device = DeviceManager.get_device()
 
 class Encoder(nn.Module):
     def __init__(self, config : 'TransformerConfig'):
@@ -26,7 +23,8 @@ class Encoder(nn.Module):
         self.proj_out = nn.Linear(config.d_model, config.latent_channels, bias=False)
 
     def forward(self, x):
-        x = self.proj_in(x)
+        # x is [b,c,h,w]
+        x = self.proj_in(x) # -> [b,p^2,d]
 
         b,n,d = x.shape
         z = eo.repeat(self.latent_tokens, 'n d -> b n d', b = b)
@@ -54,8 +52,9 @@ class Decoder(nn.Module):
         self.transformer = StackedTransformer(config)
         self.proj_in = nn.Linear(config.latent_channels, config.d_model, bias=False)
 
-    def forward(self, z):
-        z = self.proj_in(z) # [b,n,d]
+    def forward(self, z : Tensor):
+        # z is [b,l,d_latent]
+        z = self.proj_in(z) # [b,l,d]
 
         b,n_latents,d = z.shape
         x = eo.repeat(self.image_tokens, 'n d -> b n d', b = b)
@@ -77,8 +76,9 @@ class TiToKVAE(nn.Module):
 
         self.config = config
 
-    def forward(self, x: TensorType) -> Tuple[TensorType, ...]:
-        z = self.encoder(x)
+    def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:
+        # x is [b,c,h,w]
+        z = self.encoder(x) # -> [b,l,d]
 
         if self.config.noise_decoder_inputs > 0.0:
             dec_input = z + torch.randn_like(z) * self.config.noise_decoder_inputs
@@ -89,7 +89,7 @@ class TiToKVAE(nn.Module):
 
         return rec, z
 
-if __name__ == "__main__":
+def titok_test():
     from ..configs import TransformerConfig
 
     cfg = TransformerConfig(
@@ -103,12 +103,14 @@ if __name__ == "__main__":
         patch_size = 1
     )
 
-    model = TiToKVAE(cfg).float().to(device)
-
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        x = torch.randn(1, 32, 16, 16, device=device, dtype=torch.bfloat16)
+    model = TiToKVAE(cfg).bfloat16().cuda()
+    with torch.no_grad():
+        x = torch.randn(1, 32, 16, 16).bfloat16().cuda()
         rec, z = model(x)
-
-        print(f'Input shape: {x.shape}, dtype: {x.dtype}')
-        print(f'Latent shape: {z.shape}, dtype: {z.dtype}')
-        print(f'Output shape: {rec.shape}, dtype: {rec.dtype}')
+        assert rec.shape == (1, 32, 16, 16), f"Expected shape (1,32,16,16), got {rec.shape}"
+        assert z.shape == (1, 16, 128), f"Expected shape (1,16,128), got {z.shape}"
+    
+    print("Test passed!")
+    
+if __name__ == "__main__":
+    titok_test()
