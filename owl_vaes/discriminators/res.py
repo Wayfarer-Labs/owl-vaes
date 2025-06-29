@@ -6,7 +6,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ..nn.resnet import DownBlock, SameBlock
+from ..nn.resnet import DownBlock, SameBlock, LandscapeToSquare
+from torch.nn.utils.parametrizations import weight_norm
+
+def is_landscape(sample_size):
+    h,w = sample_size
+    ratio = w/h
+    return abs(ratio - 16/9) < 0.01  # Check if ratio is approximately 16:9
 
 class R3GANDiscriminator(nn.Module):
     def __init__(self, config):
@@ -17,7 +23,8 @@ class R3GANDiscriminator(nn.Module):
         ch_max = config.ch_max
         blocks_per_stage = config.blocks_per_stage
 
-        self.conv_in = nn.Conv2d(3, ch_0, 1, 1, 0, bias = False)
+        self.conv_in = LandscapeToSquare(size, config.channels, ch_0) if is_landscape(size) else weight_norm(nn.Conv2d(config.channels, ch_0, 3, 1, 1))
+        size = 512
 
         # Count number of downsampling stages needed to get from sample_size to 4
         total_blocks = len([size // (2**i) for i in range(100) if size // (2**i) >= 4])
@@ -28,31 +35,26 @@ class R3GANDiscriminator(nn.Module):
         ch = ch_0
         while size > 4:
             next_ch = min(ch*2,ch_max)
-
             blocks.append(DownBlock(ch, next_ch, blocks_per_stage, total_blocks))
-
-
             ch = next_ch
             size = size // 2
-    
-            if size == 45:
-                size = 64
 
         blocks.append(SameBlock(ch, ch_max, blocks_per_stage, total_blocks))
         self.blocks = nn.ModuleList(blocks)
 
-        self.final = nn.Conv2d(ch_max, 1, 4, 1, 0)
+        self.final = weight_norm(nn.Conv2d(ch_max, 1, 4, 1, 0))
 
-    def forward(self, x):
+    def forward(self, x, output_hidden_states = False):
         # Forward on single sample
+        h = []
         x = self.conv_in(x)
         for block in self.blocks:
             x = block(x)
-            x = self.cond(x)
+            h.append(x.clone())
 
         x = self.final(x)
         x = x.flatten(0)
-        return x
+        return (x,h) if output_hidden_states else x
         
 def r3gandiscriminator_test():
     from dataclasses import dataclass
