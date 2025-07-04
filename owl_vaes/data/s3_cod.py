@@ -141,9 +141,11 @@ def collate_fn(batch):
     # Convert PIL images to tensors and normalize to [-1, 1]
     tensors = []
     for img in batch:
+        # Print image information
+        img = img.resize((640, 360), Image.Resampling.LANCZOS).convert("RGB")
         # Convert PIL image to tensor and normalize to [0, 1]
         tensor = torch.FloatTensor(np.array(img)).permute(2, 0, 1) / 255.0
-        # Convert [0, 1] to [-1, 1]
+        # Convert [0, 1] to [-1, 1] 
         tensor = (tensor * 2) - 1
         tensors.append(tensor)
     

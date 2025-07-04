@@ -18,6 +18,7 @@ from ..utils import Timer, freeze
 from ..utils.logging import LogHelper, to_wandb, to_wandb_depth, to_wandb_flow
 from .base import BaseTrainer
 from ..losses.basic import latent_reg_loss
+from ..losses.dwt import dwt_loss_fn
 
 class RecTrainer(BaseTrainer):
     """
@@ -78,6 +79,9 @@ class RecTrainer(BaseTrainer):
         # Loss weights
         kl_weight =  self.train_cfg.loss_weights.get('kl', 0.0)
         lpips_weight = self.train_cfg.loss_weights.get('lpips', 0.0)
+        dwt_weight = self.train_cfg.loss_weights.get('dwt', 1.0)
+        l1_weight = self.train_cfg.loss_weights.get('l1', 0.0)
+        l2_weight = self.train_cfg.loss_weights.get('l2', 0.0)
 
         # Prepare model, lpips, ema
         self.model = self.model.cuda().train()
@@ -131,14 +135,27 @@ class RecTrainer(BaseTrainer):
                 with ctx:
                     batch_rec, mu, logvar = self.model(batch)
                     z = mu # For logging
-                    if kl_weight > 0:
+ 
+                    if kl_weight > 0.0:
                         reg_loss = latent_reg_loss(mu, logvar) / accum_steps
                         total_loss += reg_loss * kl_weight
                         metrics.log('kl_loss', reg_loss)
 
-                    mse_loss = F.mse_loss(batch_rec, batch) / accum_steps
-                    total_loss += mse_loss
-                    metrics.log('mse_loss', mse_loss)
+                    if l1_weight > 0.0:
+                        l1_loss = F.l1_loss(batch_rec, batch) / accum_steps
+                        total_loss += l1_loss * l1_weight
+                        metrics.log('l1_loss', l1_loss)
+                    
+                    if l2_weight > 0.0:
+                        l2_loss = F.mse_loss(batch_rec, batch) / accum_steps
+                        total_loss += l2_loss * l2_weight
+                        metrics.log('l2_loss', l2_loss)
+
+                    if dwt_weight > 0.0:
+                        with ctx:
+                            dwt_loss = dwt_loss_fn(batch_rec[:,:3], batch[:,:3]) / accum_steps
+                        total_loss += dwt_loss * dwt_weight
+                        metrics.log('dwt_loss', dwt_loss)
 
                     if lpips_weight > 0.0:
                         lpips_loss = lpips(batch_rec[:,:3], batch[:,:3]) / accum_steps

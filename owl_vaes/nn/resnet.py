@@ -54,8 +54,6 @@ class ResBlock(nn.Module):
         nn.init.zeros_(self.conv3.weight)
 
     def forward(self, x):
-        res = x.clone()
-
         def _inner(x):
             x = self.conv1(x)
             #x = self.norm1(x)
@@ -67,11 +65,11 @@ class ResBlock(nn.Module):
             return x
 
         if self.training:
-            x = checkpoint(_inner, x)
+            x = checkpoint(_inner, x) + x.clone()
         else:
-            x = _inner(x)
+            x = _inner(x) + x.clone()
 
-        return x + res
+        return x
 
 class Upsample(nn.Module):
     """

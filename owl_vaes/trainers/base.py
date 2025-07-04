@@ -65,5 +65,12 @@ class BaseTrainer:
 
         torch.save(save_dict, fp)
 
+        if 'ema' in save_dict and getattr(self.train_cfg, 'output_path', None) is not None:
+            out_d = save_dict['ema']
+            prefix = "ema_model.module." if self.world_size > 1 else "ema_model."
+            out_d = {k[len(prefix):]: v for k, v in out_d.items() if k.startswith(prefix)}
+            os.makedirs(self.train_cfg.output_path, exist_ok = True)
+            torch.save(out_d, os.path.join(self.train_cfg.output_path, f"step_{self.total_step_counter}.pt"))
+
     def load(self, path: str):
         return torch.load(path, map_location="cpu", weights_only=False)

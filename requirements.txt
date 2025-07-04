@@ -16,3 +16,4 @@ wandb[media]
 rotary-embedding-torch
 boto3
 diffusers
+pytorch-wavelets

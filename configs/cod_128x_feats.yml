@@ -1,0 +1,64 @@
+# Config for a simple 256 -> 16 autoencoder
+model:
+  model_id: dcae
+  sample_size: [360,640]
+  channels: 7
+  latent_size: 8
+  latent_channels: 128
+
+  ch_0: 256
+  ch_max: 2048
+
+  encoder_blocks_per_stage: [4, 4, 4, 4, 4, 4]
+  decoder_blocks_per_stage: [4, 4, 4, 4, 4, 4]
+
+  use_middle_block: false
+
+train:
+  trainer_id: rec
+  data_id: s3_cod_features
+  data_kwargs:
+    bucket_name: cod-raw-360p-30fs
+    prefix: rgb-depth-flow
+    include_flow: true
+    include_depth: true
+
+  target_batch_size: 32
+  batch_size: 4
+
+  epochs: 200
+
+  opt: AdamW
+  opt_kwargs:
+    lr: 3.0e-5
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.95]
+    eps: 1.0e-15
+
+  lpips_type: convnext
+  loss_weights:
+    kl: 1.0e-6
+    lpips: 10.0
+    dwt: 0.0
+    l1: 0.0
+    l2: 1.0
+
+  scheduler: LinearWarmup
+  scheduler_kwargs:
+    warmup_steps: 3000
+    min_lr: 3.0e-6
+
+  checkpoint_dir: /mnt/data/checkpoints/owl_vaes/cod_128x_feats
+  output_path: /mnt/data/checkpoints/owl_vaes/cod_128x_feats_output
+  resume_ckpt: /mnt/data/checkpoints/owl_vaes/cod_128x_feats/cod_128x_feats_75k_train.pt
+
+  sample_interval: 1000
+  save_interval: 5000
+
+  teacher_cfg: configs/cod_128x_feats.yml
+  teacher_ckpt: /mnt/data/checkpoints/owl_vaes/cod_128x_feats/cod_128x_feats/cod_128x_feats_160k_ema.pt
+
+wandb:
+  name: ${env:WANDB_USER_NAME}
+  project: new_vaes
+  run_name: 128x_cod_feats
