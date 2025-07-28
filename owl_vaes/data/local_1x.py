@@ -40,49 +40,72 @@ def _repo_id_from_url(hf_url: str) -> str:
 def _load_segment(segment_path: Path) -> np.memmap:
     return np.memmap(str(segment_path.absolute()), dtype=np.uint32)
 
-@ray.remote(num_cpus=1, memory=8_000_000_000)  # 8GB per task - allows ~64 concurrent tasks
+
+# Alternative version that's even more memory efficient - processes in chunks
+@ray.remote(num_cpus=1, memory=8_000_000_000)
 def _process_video(shard_idx: int, video_path: Path, segment_path: Path, save_dir: Path) -> dict:
     """Ray remote function for processing a single video shard."""
-    segment_n   = _load_segment(segment_path)
-    video_nchw  = VideoDecoder(str(video_path))
+    segment_n = _load_segment(segment_path)
+    video_nchw = VideoDecoder(str(video_path))
 
     assert segment_n.shape[0] == video_nchw._num_frames, f'{segment_n.shape=} {video_nchw._num_frames=}'
     
     imgs_dir = save_dir.absolute() / 'images'
     imgs_dir.mkdir(exist_ok=True, parents=True)
 
+    # Initialize with the first episode from the data
+    current_episode = int(segment_n[0]) if len(segment_n) > 0 else 0
     episode_start_idx = 0
-    current_episode   = 0
     episode_to_num_frames: dict[int, int] = {}
+    episodes_seen = []
 
+    # Process all frames
     for i, frame_chw in enumerate(video_nchw):
         episode = int(segment_n[i])
 
+        # Detect episode boundary
         if episode != current_episode:
-            episode_to_num_frames[current_episode] = i - episode_start_idx
+            # Record the previous episode's frame count
+            frames_in_prev_episode = i - episode_start_idx
+            episode_to_num_frames[current_episode] = frames_in_prev_episode
+            episodes_seen.append(current_episode)
+            
+            print(f'Shard {shard_idx}: Episode {current_episode} completed with {frames_in_prev_episode} frames')
+            
+            # Start tracking the new episode
             episode_start_idx = i
             current_episode = episode
 
+        # Calculate frame index within the current episode
         frame_idx = i - episode_start_idx
         filename = str(imgs_dir / f'rgb_sh{shard_idx}_ep{episode}_fr{frame_idx}.jpeg')
         write_jpeg(frame_chw, filename, quality=95)
 
-    print(f'Finished writing entire shard {shard_idx} with num-episodes={current_episode}')
+    # Don't forget the final episode!
+    final_episode_frames = len(segment_n) - episode_start_idx
+    episode_to_num_frames[current_episode] = final_episode_frames
+    episodes_seen.append(current_episode)
+    
+    print(f'Shard {shard_idx}: Final episode {current_episode} completed with {final_episode_frames} frames')
+    print(f'Shard {shard_idx}: Finished processing {len(episodes_seen)} episodes, {len(segment_n)} total frames')
+
     video_info = {
         'shard_idx': shard_idx,
-        'episodes': current_episode,
-        'num_frames_per_episode': episode_to_num_frames
+        'episodes': episodes_seen,  # List of episode IDs, not just the last one
+        'num_frames_per_episode': episode_to_num_frames,
+        'total_frames': len(segment_n),
+        'total_episodes': len(episodes_seen)
     }
 
-    metadata_dir  = save_dir.absolute() / 'metadata' 
+    metadata_dir = save_dir.absolute() / 'metadata' 
     metadata_dir.mkdir(exist_ok=True, parents=True)
     metadata_path = metadata_dir / f'metadata_{shard_idx}.json'
 
     with open(metadata_path, 'w') as f:
-        f.write(json.dumps(video_info))
+        json.dump(video_info, f, indent=2)  # Use json.dump instead of json.dumps
     
     return video_info
-
+    
 
 def train_iter() -> Generator[tuple[int, Path, Path]]:
     video_dir       = DATASET_ROOT  / 'train_v2.0_raw' / 'videos'
