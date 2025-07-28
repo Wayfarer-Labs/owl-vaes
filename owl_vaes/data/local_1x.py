@@ -50,7 +50,7 @@ def _process_video(shard_idx: int, video_path: Path, segment_path: Path, save_di
     
     episode_to_frames: dict[int, list[torch.Tensor]] = defaultdict(list)
 
-    for i, frame in enumerate(video_nchw):
+    for i, frame in enumerate(video_nchw[:100]):
         episode = int(segment_n[i])
         episode_to_frames[episode].append(frame)
 
@@ -146,16 +146,11 @@ def setup_dataset(hf_url: str = HF_URL) -> None:
     print(f'All {len(results)} video shards processed successfully!')
     
     # Calculate and print processing statistics
-    total_frames = sum(result['total_frames'] for result in results)
-    total_time = max(result['processing_time_seconds'] for result in results)  # Max since parallel
-    avg_time_per_shard = sum(result['processing_time_seconds'] for result in results) / len(results)
+    total_frames = sum(sum(result['num_frames_per_episode'].values()) for result in results)
     
     print(f"\n=== Processing Summary ===")
     print(f"Total frames processed: {total_frames:,}")
     print(f"Total shards: {len(results)}")
-    print(f"Wall clock time: {total_time:.2f} seconds")
-    print(f"Average time per shard: {avg_time_per_shard:.2f} seconds")
-    print(f"Effective throughput: {total_frames/total_time:.1f} frames/second")
     print(f"Ray cluster resources: {ray.cluster_resources()}")
     
     # Optionally shutdown Ray when done
