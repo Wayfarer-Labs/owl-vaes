@@ -2,6 +2,9 @@ def get_loader(data_id: str, batch_size: int, **data_kwargs):
     if data_id == "mnist":
         from . import mnist
         return mnist.get_loader(batch_size)
+    if data_id == "local_1x":
+        from . import local_1x
+        return local_1x.get_loader(batch_size, **data_kwargs)
     if data_id == "local_imagenet_256":
         from . import local_imagenet_256
         return local_imagenet_256.get_loader(batch_size)
