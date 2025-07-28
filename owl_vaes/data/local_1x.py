@@ -48,26 +48,30 @@ def _process_video(shard_idx: int, video_path: Path, segment_path: Path, save_di
 
     assert segment_n.shape[0] == video_nchw._num_frames, f'{segment_n.shape=} {video_nchw._num_frames=}'
     
-    episode_to_frames: dict[int, list[torch.Tensor]] = defaultdict(list)
+    imgs_dir = save_dir.absolute() / 'images'
+    imgs_dir.mkdir(exist_ok=True, parents=True)
 
-    for i, frame in enumerate(video_nchw):
+    episode_start_idx = 0
+    current_episode   = 0
+    episode_to_num_frames: dict[int, int] = {}
+
+    for i, frame_chw in enumerate(video_nchw):
         episode = int(segment_n[i])
-        episode_to_frames[episode].append(frame)
 
-    for episode, frames in episode_to_frames.items():
-        for frame_idx, frame_chw in enumerate(frames):
-            imgs_dir = save_dir.absolute() / 'images'
-            imgs_dir.mkdir(exist_ok=True, parents=True)
-            filename = str(imgs_dir / f'rgb_sh{shard_idx}_ep{episode}_fr{frame_idx}.jpeg')
-            write_jpeg(frame_chw, filename, quality=95)
+        if episode != current_episode:
+            episode_to_num_frames[current_episode] = i - episode_start_idx
+            episode_start_idx = i
+            current_episode = episode
 
-        print(f'Finished writing {episode=} in shard={shard_idx} with n-frames={len(frames)}')
+        frame_idx = i - episode_start_idx
+        filename = str(imgs_dir / f'rgb_sh{shard_idx}_ep{episode}_fr{frame_idx}.jpeg')
+        write_jpeg(frame_chw, filename, quality=95)
 
-    print(f'Finished writing entire shard {shard_idx} with num-episodes={len(episode_to_frames)}')
+    print(f'Finished writing entire shard {shard_idx} with num-episodes={current_episode}')
     video_info = {
         'shard_idx': shard_idx,
-        'episodes': list(episode_to_frames.keys()),
-        'num_frames_per_episode': {episode_idx: len(frames) for episode_idx, frames in episode_to_frames.items()}
+        'episodes': current_episode,
+        'num_frames_per_episode': episode_to_num_frames
     }
 
     metadata_dir  = save_dir.absolute() / 'metadata' 
