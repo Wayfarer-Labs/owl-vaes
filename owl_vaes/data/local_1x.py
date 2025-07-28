@@ -50,7 +50,7 @@ def _process_video(shard_idx: int, video_path: Path, segment_path: Path, save_di
     
     episode_to_frames: dict[int, list[torch.Tensor]] = defaultdict(list)
 
-    for i, frame in enumerate(video_nchw[:100]):
+    for i, frame in enumerate(video_nchw):
         episode = int(segment_n[i])
         episode_to_frames[episode].append(frame)
 
