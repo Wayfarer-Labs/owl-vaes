@@ -7,14 +7,15 @@ import shutil
 from pathlib import Path
 from typing import Iterable, Generator
 from torchcodec.decoders import VideoDecoder
-
+from typing import Literal
 import numpy as np
 import torch
 import ray
 import time
 from huggingface_hub import snapshot_download
 from tqdm import tqdm
-from torchvision.io import write_jpeg
+from torchvision.io import write_jpeg, decode_image
+from torch.utils.data import DataLoader, IterableDataset
 
 HF_URL       = "https://huggingface.co/datasets/1x-technologies/world_model_raw_data"
 DATASET_ROOT = Path("/mnt") / "data" / "sami" / "1x_dataset" / "original"
@@ -42,7 +43,7 @@ def _load_segment(segment_path: Path) -> np.memmap:
 
 
 # Alternative version that's even more memory efficient - processes in chunks
-@ray.remote(num_cpus=1, memory=8_000_000_000)
+@ray.remote(num_cpus=1, memory=8_000_000_000, retry_exceptions=False)
 def _process_video(shard_idx: int, video_path: Path, segment_path: Path, save_dir: Path) -> dict:
     """Ray remote function for processing a single video shard."""
     segment_n = _load_segment(segment_path)
@@ -146,7 +147,8 @@ def setup_dataset(hf_url: str = HF_URL) -> None:
     # Process videos in parallel using Ray with progress tracking
     tasks = []
     task_ids = []
-    
+
+
     for shard_idx, video_path, segment_path in train_iter():
         task = _process_video.remote(shard_idx, video_path, segment_path, train_dir)
         tasks.append(task)
@@ -184,5 +186,82 @@ def setup_dataset(hf_url: str = HF_URL) -> None:
     ray.shutdown()
 
 
+
+class Robotics_1X_Dataset(IterableDataset):
+    def __init__(self, root: Path = IMAGE_PATH, split: Literal['train', 'val'] = 'train'):
+        super().__init__()
+
+        self.image_root     = root / split / 'images'
+        self.metadata_root  = root / split / 'metadata'
+
+        self.all_metadata: list[dict]   = [
+            json.load(open(str(path)))
+            for path in self.metadata_root.glob('metadata_*.json')
+        ]
+
+        self.metadata: dict = {
+            meta['shard_idx']: meta for meta in self.all_metadata
+        } 
+        # NOTE turns out each metadata has a global episode, instead of a local one.
+        # e.g. metadata_0.json ends at episode 519, metadata_1.jsson starts at 520.
+        # This means we can randomly sample an episode, and then a frame number, and load.
+        self.episode_to_shard = {
+            e: meta['shard_idx']
+            for meta in self.all_metadata
+            for e in meta['episodes']
+        }
+        self.episode_to_nframes = {
+            int(e): meta['num_frames_per_episode'][e]
+            for meta in self.all_metadata
+            for e in meta['num_frames_per_episode']
+        }
+        assert set(self.episode_to_shard) == set(self.episode_to_nframes)
+        print(f'Loaded metadata for {len(self.episode_to_shard)} episodes totaling {sum(self.episode_to_nframes.values())} frames')
+
+    def random_filename(self) -> Path:
+        import random
+        episode      = random.randint(0, max(self.episode_to_shard.keys()))
+        frame        = random.randint(0, self.episode_to_nframes[episode]-1)
+        shard        = self.episode_to_shard[episode]
+        return self.image_root / f'rgb_sh{shard}_ep{episode}_fr{frame}.jpeg'
+    
+    def get_random_image(self) -> torch.Tensor:
+        filename    = self.random_filename()
+        image_chw   = decode_image(filename)
+        return image_chw
+
+    def __iter__(self):
+        while True: yield self.get_random_image()
+
+def collate_fn(x):
+    # x is list of frames
+    res = torch.stack(x)
+    return res  # [b,c,h,w]
+
+def get_loader(batch_size, **data_kwargs):
+    dataset = Robotics_1X_Dataset()
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        collate_fn=collate_fn,
+        **data_kwargs
+    )
+    return loader
+
 if __name__ == "__main__":
-    setup_dataset()
+    # setup_dataset()
+    ds = Robotics_1X_Dataset()
+    dl = get_loader(64, num_workers=16)
+    idl = iter(dl)
+    i = 0
+    n = 256
+    ttkn = 0
+    while i < n:
+        start_time = time.time()
+        batch = next(idl)
+        end_time = time.time()
+        print(f'Batch load took {end_time - start_time}')
+        i += 1
+        ttkn += end_time - start_time
+
+    print(f'time taken avg: {ttkn / n}')
