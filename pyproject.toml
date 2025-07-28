@@ -27,6 +27,7 @@ dependencies = [
     "alias-free-torch>=0.0.6",
     "torchvision>=0.22.0",
     "lpips>=0.1.4",
+    "torchcodec",
 ]
 
 [tool.setuptools.packages.find]
