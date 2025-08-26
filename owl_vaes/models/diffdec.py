@@ -57,7 +57,6 @@ class DiffusionDecoderCore(nn.Module):
             self.blocks = HDiT(config)
         self.config = config
 
-    @torch.compile
     def forward(self, x, z, ts):
         # x is [b,c,h,w]
         # z is [b,c,h,w] but different size cause latent
@@ -105,14 +104,14 @@ class DiffusionDecoder(nn.Module):
 
         self.core = DiffusionDecoderCore(config)
 
-        self.ts_mu = 0.0
+        self.ts_mu = 0.4
         self.ts_sigma = 1.0
 
     @torch.no_grad()
     def sample_timesteps(self, b, device, dtype):
         # Sample ts in [0, 1] from a normal distribution, then sigmoid
         ts = torch.randn(b, device=device, dtype=dtype)
-        ts = ts * self.ts_sigma + self.ts_mu
+        ts = ts * self.ts_sigma - self.ts_mu
         ts = ts.sigmoid()
         return ts
 

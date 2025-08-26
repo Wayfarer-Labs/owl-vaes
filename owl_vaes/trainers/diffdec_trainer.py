@@ -168,7 +168,8 @@ class DiffusionDecoderTrainer(BaseTrainer):
                 with torch.no_grad():
                     teacher_enc_input = F.interpolate(teacher_enc_input, size=tuple(self.teacher_size), mode='bilinear', align_corners=False)
                     teacher_mu, teacher_logvar = self.encoder(teacher_enc_input)
-                    teacher_z = torch.randn_like(teacher_mu) * (teacher_logvar/2).exp() + teacher_mu
+                    teacher_std = (teacher_logvar/2).exp()
+                    teacher_z = torch.randn_like(teacher_mu) * teacher_std + teacher_mu
                     teacher_z = teacher_z / self.train_cfg.latent_scale
                     
                     batch = F.interpolate(batch, size=tuple(self.train_cfg.vae_size), mode='bilinear', align_corners=False)
