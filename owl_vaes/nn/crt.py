@@ -14,7 +14,8 @@ class CRT(nn.Module):
                 n_heads=6,
                 d_model=384,
                 causal=True,
-                block_size=1
+                block_size=1,
+                rope_impl='simple'
             )
 
         self.core = StackedTransformer(config)

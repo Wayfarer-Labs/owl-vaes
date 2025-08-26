@@ -8,7 +8,7 @@ from owl_vaes.configs import TransformerConfig
 from .mimetic import mimetic_init
 from .mlp import MLP
 from .normalization import LayerNorm, QKNorm
-from .rope import ImageRoPEWithLatent
+from .rope import get_rope_impl
 
 torch.backends.cuda.enable_flash_sdp(enabled=True)
 
@@ -33,10 +33,8 @@ class Attn(nn.Module):
         rope_impl = getattr(config, "rope_impl", None)
         if rope_impl is None:
             self.rope = None
-        elif rope_impl == "image+latent":
-            self.rope = ImageRoPEWithLatent(config)
         else:
-            raise ValueError(f"Invalid rope implementation: {rope_impl}")
+            self.rope = get_rope_impl(rope_impl)(config)
         self.causal = config.causal
 
         self.layer_ind = None
@@ -58,7 +56,7 @@ class Attn(nn.Module):
         q, k = self.qk_norm(q, k)
         if self.rope is not None:
             q, k = self.rope(q, k)
-        x_out = F.scaled_dot_product_attention(q, k, v)
+        x_out = F.scaled_dot_product_attention(q, k, v, is_causal = self.causal)
         x_out = x_out.to(x.dtype)
 
         # Rearrange from [b, h, n, d] -> [b, n, h * d]

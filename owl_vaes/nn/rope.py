@@ -15,6 +15,37 @@ def int_to_tuple(x):
         except:
             raise ValueError(f"Invalid input: {x}")
 
+def get_rope_impl(impl_name):
+    impl_name = impl_name.lower()
+    if impl_name == "simple":
+        return SimpleRoPE
+    elif impl_name == "image":
+        return ImageRoPE
+    elif impl_name == "image+latent":
+        return ImageRoPEWithLatent
+    else:
+        raise ValueError(f"Invalid rope implementation: {impl_name}")
+
+class SimpleRoPE(nn.Module):
+    """
+    1D Rotary Positional Embedding for sequence data.
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.dim_head = config.d_model // config.n_heads
+        self.rope = RotaryEmbedding(self.dim_head, freqs_for="lang", theta = 300)
+
+    def forward(self, q, k):
+        q = self.apply(q)
+        k = self.apply(k)
+        return q, k
+
+    def apply(self, x):
+        # x: [b, h, n, d]
+        b, h, n, d = x.shape
+        x_rope = self.rope.rotate_queries_or_keys(x.float()).to(x.dtype)
+        return x_rope
+
 class ImageRoPE(nn.Module):
     def __init__(self, config):
         super().__init__()
