@@ -105,7 +105,7 @@ class DistillDecTrainer(BaseTrainer):
         self.ema.load_state_dict(save_dict['ema'])
         self.opt.load_state_dict(save_dict['opt'])
         if self.scheduler is not None and 'scheduler' in save_dict:
-            self.scheduler.state_dict(save_dict['scheduler'])
+            self.scheduler.load_state_dict(save_dict['scheduler'])
         self.scaler.load_state_dict(save_dict['scaler'])
         self.total_step_counter = save_dict['steps']
 
@@ -138,7 +138,7 @@ class DistillDecTrainer(BaseTrainer):
             lpips = get_lpips_cls(self.train_cfg.lpips_type)(self.device).to(self.device).eval()
             freeze(lpips)
 
-        self.encoder = self.encoder.to(self.device).bfloat16().eval()
+        self.encoder = self.encoder.to(self.device).bfloat16()
         freeze(self.encoder)
         self.encoder = torch.compile(self.encoder, mode='max-autotune',dynamic=False,fullgraph=True)
         self.teacher_decoder = self.teacher_decoder.to(self.device).bfloat16().eval()
@@ -258,8 +258,10 @@ class DistillDecTrainer(BaseTrainer):
 
                 with ctx:
                     with torch.no_grad():
-                        teacher_z = self.encoder(batch) / self.train_cfg.latent_scale
-                        teacher_z = teacher_z + torch.randn_like(teacher_z) * 0.01
+                        teacher_mu, teacher_logvar = self.encoder(batch)
+                        teacher_std = (teacher_logvar/2).exp()
+                        teacher_z = torch.randn_like(teacher_mu) * teacher_std + teacher_mu
+                        teacher_z = teacher_z / self.train_cfg.latent_scale
                         batch = batch[:,:3]
 
                     batch_rec = self.model(teacher_z)

@@ -6,7 +6,7 @@ model:
   latent_channels: 128
   patch_size: 1
 
-  n_layers: 28
+  n_layers: 24
   n_heads: 24
   d_model: 1536
 
@@ -21,13 +21,13 @@ train:
   trainer_id: diff_dec
   data_id: s3_cod_features
   data_kwargs:
-    bucket_name: yt-data-depth
-    prefix: depth-and-raw
+    bucket_name: cod-yt-frames-1080p
+    prefix: depth-and-rgb
     include_depth: true
     target_size: [1024, 1024]
 
   target_batch_size: 256
-  batch_size: 16
+  batch_size: 32
 
   epochs: 200
 
@@ -49,7 +49,7 @@ train:
   teacher_cfg: configs/cod_yt_v2/base.yml
 
   latent_scale: 0.65
-  ldm_scale: 1.0
+  ldm_scale: 0.4552
   sampling_steps: 20
   vae_size: [1024,1024]
   vae_id: dcae

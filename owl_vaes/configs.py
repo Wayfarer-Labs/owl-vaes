@@ -49,6 +49,7 @@ class TransformerConfig(VAEConfig):
 
     # Proxy stuff
     proxy_patch_size : int = 1
+    dropout : float = 0.0
     rope_impl : str = "image+latent" # or "image+latent"
 
 @dataclass

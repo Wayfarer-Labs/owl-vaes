@@ -7,7 +7,7 @@ class MLP(nn.Module):
 
         self.fc1 = nn.Linear(config.d_model, 4 * config.d_model)
         self.fc2 = nn.Linear(4 * config.d_model, config.d_model)
-        self.dropout = nn.Dropout(config.dropout)
+        self.dropout = nn.Dropout(getattr(config, "dropout", 0))
 
     def forward(self, x):
         x = self.fc1(x)
