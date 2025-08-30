@@ -162,3 +162,46 @@ def log_audio_to_wandb(
         )
 
     return audio_logs
+
+def to_wandb_video(x):
+    # x is [b,n,c,h,w] [-1,1]
+    x = x.clamp(-1,1) * 127.5 + 127.5
+    x = x.to(torch.uint8).cpu()
+    x = x.numpy()
+    return [wandb.Video(x_i, fps=10, format="gif") for x_i in x]
+
+def to_wandb_video_sidebyside(original, reconstructed):
+    """
+    Create side-by-side video comparisons of original and reconstructed videos.
+    
+    Args:
+        original: Original video tensor [b,n,c,h,w] [-1,1]  
+        reconstructed: Reconstructed video tensor [b,n,c,h,w] [-1,1]
+    
+    Returns:
+        List of wandb.Video objects showing side-by-side comparisons
+    """
+
+    def to_vid(t):
+        t = t.clamp(-1,1) * 127.5 + 127.5
+        t = t.to(torch.uint8).cpu()
+        t = t.numpy()
+        return t
+
+    # Concatenate horizontally (side by side)
+    combined = torch.cat([original, reconstructed], dim=-1)  # [b,n,c,h,2*w]
+    
+    # Convert to uint8 range [0,255]
+    combined = combined.clamp(-1,1) * 127.5 + 127.5
+    combined = combined.to(torch.uint8).cpu()
+    combined = combined.numpy()
+
+    rgb = to_vid(original)
+    rec = to_vid(reconstructed)
+
+    wandb_dict = {
+        'original' : [wandb.Video(rgb_i, fps=10, format="mp4") for rgb_i in rgb],
+        'reconstructed' : [wandb.Video(rec_i, fps=10, format="mp4") for rec_i in rec],
+    }
+    
+    return wandb_dict
