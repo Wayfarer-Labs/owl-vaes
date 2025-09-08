@@ -12,11 +12,7 @@ from ..nn.sana import ChannelToSpace, SpaceToChannel
 
 from torch.nn.utils.parametrizations import weight_norm
 from torch.utils.checkpoint import checkpoint
-
-def is_landscape(sample_size):
-    h,w = sample_size
-    ratio = w/h
-    return abs(ratio - 16/9) < 0.01  # Check if ratio is approximately 16:9
+import torch.distributions as dist
 
 class Encoder(nn.Module):
     def __init__(self, config : 'ResNetConfig'):
@@ -28,7 +24,7 @@ class Encoder(nn.Module):
         ch_max = config.ch_max
         self.skip_logvar = getattr(config, "skip_logvar", False)
 
-        self.conv_in = LandscapeToSquare(size, config.channels, ch_0) if is_landscape(size) else weight_norm(nn.Conv2d(config.channels, ch_0, 3, 1, 1))
+        self.conv_in = weight_norm(nn.Conv2d(config.channels, ch_0, 3, 1, 1))
 
         blocks = []
         residuals = []
@@ -121,7 +117,7 @@ class Decoder(nn.Module):
         self.blocks = nn.ModuleList(list(reversed(blocks)))
         self.residuals = nn.ModuleList(list(reversed(residuals)))
 
-        self.conv_out = SquareToLandscape(size, ch_0, config.channels) if is_landscape(size) else weight_norm(nn.Conv2d(ch_0, config.channels, 3, 1, 1, bias = False))
+        self.conv_out = weight_norm(nn.Conv2d(ch_0, config.channels, 3, 1, 1, bias = False))
         self.act_out = nn.SiLU()
 
         self.decoder_only = decoder_only
@@ -144,6 +140,31 @@ class Decoder(nn.Module):
 
         return x
 
+@torch.no_grad()
+def get_ch_prime(total_ch, min_ch=16, step=4):
+    """
+    Returns an integer sampled from the sequence [min_ch, min_ch+step, ..., total_ch]
+    (inclusive of total_ch if it lands on a step), and ensures the value is the same across all devices.
+    """
+    # Build the valid channel choices
+    ch_choices = list(range(min_ch, total_ch + 1, step))
+    ch_choices_tensor = torch.tensor(ch_choices, dtype=torch.long, device='cuda' if torch.cuda.is_available() else 'cpu')
+    num_choices = len(ch_choices)
+
+    if torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+        if rank == 0:
+            idx = torch.randint(0, num_choices, (1,), device=ch_choices_tensor.device)
+        else:
+            idx = torch.empty(1, dtype=torch.long, device=ch_choices_tensor.device)
+        torch.distributed.broadcast(idx, src=0)
+        ch_prime = ch_choices_tensor[idx.item()]
+        return int(ch_prime.item())
+    else:
+        idx = torch.randint(0, num_choices, (1,), device=ch_choices_tensor.device)
+        ch_prime = ch_choices_tensor[idx.item()]
+        return int(ch_prime.item())
+
 class DCAE(nn.Module):
     """
     DCAE based autoencoder that takes a ResNetConfig to configure.
@@ -155,10 +176,18 @@ class DCAE(nn.Module):
         self.decoder = Decoder(config)
 
         self.config = config
+        self.do_channel_mask = getattr(config, 'do_channel_mask', False)
 
     def forward(self, x):
         mu, logvar = self.encoder(x)
         z = torch.randn_like(mu) * (logvar/2).exp() + mu
+
+        if self.do_channel_mask and self.training:
+            _,chans,_,_ = z.shape
+            
+            ch_prime = get_ch_prime(chans)
+            z[:, ch_prime:, :, :] = 0
+
         rec = self.decoder(z)
         return rec, mu, logvar
 

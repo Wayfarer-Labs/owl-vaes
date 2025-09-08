@@ -57,6 +57,8 @@ class RecTrainer(BaseTrainer):
             self.crt = CRT(self.model_cfg.latent_channels)
             self.crt_opt = None
 
+        self.do_channel_mask = getattr(self.train_cfg, 'channel_mask', False)
+
     def save(self):
         save_dict = {
             'model' : self.model.state_dict(),

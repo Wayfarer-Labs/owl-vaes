@@ -73,4 +73,4 @@ class BaseTrainer:
             torch.save(out_d, os.path.join(self.train_cfg.output_path, f"step_{self.total_step_counter}.pt"))
 
     def load(self, path: str):
-        return torch.load(path, map_location="cpu", weights_only=False)
+        return torch.load(path, map_location=self.device, weights_only=False)
