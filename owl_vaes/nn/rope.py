@@ -4,6 +4,27 @@ import torch.nn.functional as F
 
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 
+def scatter_heads(full_x: torch.Tensor, x: torch.Tensor, mask: torch.Tensor):
+    """
+    full_x: [b, h, n, d]  (destination buffer; modified in-place)
+    x:      [b, h, m, d]  (values to insert)
+    mask:   [b, n]        (exactly m True per row)
+
+    Returns: full_x with x scattered into positions where mask==True (per batch row).
+    """
+    assert full_x.dim() == 4 and x.dim() == 4 and mask.dim() == 2
+    b, h, n, d = full_x.shape
+    bb, hh, m, dd = x.shape
+    bm, nm = mask.shape
+    assert b == bb == bm and h == hh and n == nm and d == dd, "shape mismatch"
+    # Build per-row source indices (where mask is True) -> [b, m]
+    sel_idx = torch.arange(n, device=x.device).expand(b, n)[mask].reshape(b, m)  # [b, m]
+    # Expand to match [b, h, m, d] so we can scatter along dim=2 (the n-dimension)
+    index_n = sel_idx[:, None, :, None].expand(b, h, m, d)                      # [b, h, m, d]
+    # In-place scatter: write x into full_x at those positions
+    full_x.scatter_(dim=2, index=index_n, src=x)
+    return full_x
+
 def int_to_tuple(x):
     if isinstance(x, int):
         return (x,x)
@@ -114,8 +135,14 @@ class ImageRoPEWithLatent(nn.Module):
         self.n_p_x = n_p_x
         self.n_image = n_p_y * n_p_x
         self.n_latent = config.latent_size
+        self.n_heads = config.n_heads
 
-    def apply(self, x):
+    def apply(self, x, tread_mask = None):
+        b_orig,h_orig,n_orig,d_orig = x.shape
+        if tread_mask is not None:
+            full_x = torch.zeros(b_orig,h_orig,tread_mask.shape[1],d_orig, device=x.device, dtype=x.dtype)
+            x = scatter_heads(full_x, x, tread_mask)
+
         x_image = x[:,:,:self.n_image]
         x_latent = x[:,:,self.n_image:]
         
@@ -142,11 +169,16 @@ class ImageRoPEWithLatent(nn.Module):
         x_image = x_image.view(b,h,self.n_image,d)
         x_latent = x_latent.view(b,h,self.n_latent**2,d)
         x = torch.cat([x_image, x_latent], dim = 2)
+
+        if tread_mask is not None:
+            tread_mask_head = tread_mask[:,None,:].repeat(1,self.n_heads,1)
+            x = x[tread_mask_head].view(b_orig,h_orig,-1,d_orig)
+
         return x
     
-    def forward(self, q, k):
-        q = self.apply(q)
-        k = self.apply(k)
+    def forward(self, q, k, tread_mask = None):
+        q = self.apply(q, tread_mask)
+        k = self.apply(k, tread_mask)
         return q, k
 
 if __name__ == "__main__":

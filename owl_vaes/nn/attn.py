@@ -20,6 +20,9 @@ try:
 except:
     print("Warning: Failed to import Flash Cosine Attn. It's only needed for HDiT so you can ignore if not needed.")
 
+from torch.nn.attention.flex_attention import flex_attention
+flex_attention = torch.compile(flex_attention)
+
 class Attn(nn.Module):
     def __init__(self, config : TransformerConfig):
         super().__init__()
@@ -41,7 +44,7 @@ class Attn(nn.Module):
 
         nn.init.zeros_(self.out.weight)
 
-    def forward(self, x, kv_cache = None):
+    def forward(self, x, kv_cache = None, tread_mask = None):
         # x: [b, n, d_model]
         b, n, d_model = x.shape
         h = self.n_heads
@@ -55,8 +58,9 @@ class Attn(nn.Module):
 
         q, k = self.qk_norm(q, k)
         if self.rope is not None:
-            q, k = self.rope(q, k)
+            q, k = self.rope(q, k, tread_mask)
         x_out = F.scaled_dot_product_attention(q, k, v, is_causal = self.causal)
+        #x_out = flex_attention(q,k,v)
         x_out = x_out.to(x.dtype)
 
         # Rearrange from [b, h, n, d] -> [b, n, h * d]
