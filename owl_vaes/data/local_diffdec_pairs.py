@@ -85,7 +85,7 @@ def collate_fn_rgb_depth(batch):
 
 def get_loader(batch_size, **data_kwargs):
     ds = LocalLatentDataset(**data_kwargs)
-    return DataLoader(ds, batch_size=batch_size, collate_fn=collate_fn_rgb_depth)
+    return DataLoader(ds, batch_size=batch_size, num_workers = 8, prefetch_factor = 2, pin_memory=True, collate_fn=collate_fn_rgb_depth)
 
 def draw_tensor(tensor, filename="sample.png"):
     """
@@ -125,39 +125,27 @@ def draw_tensor(tensor, filename="sample.png"):
 
 if __name__ == "__main__":
     root_dir = "/mnt/data/datasets/cod_yt_latents"
-    batch_size = 256
+    batch_size = 32
 
     loader = get_loader(batch_size, root_dir=root_dir, window_size=4)
     batch_rgb, batch_depth = next(iter(loader))
 
-    print("RGB batch shape:", batch_rgb.shape)
-    print("Depth batch shape:", batch_depth.shape)
+    import time
 
-    print("RGB stats:")
-    print("  min:", batch_rgb.min().item())
-    print("  mean:", batch_rgb.float().mean().item())
-    print("  max:", batch_rgb.max().item())
-    print("  std:", batch_rgb.float().std().item())
+    n_batches = 22
+    times = []
+    loader_iter = iter(loader)
 
-    print("Depth stats:")
-    print("  min:", batch_depth.min().item())
-    print("  mean:", batch_depth.float().mean().item())
-    print("  max:", batch_depth.max().item())
-    print("  std:", batch_depth.float().std().item())
+    # Preload first 2 batches (not timed)
+    for _ in range(2):
+        _ = next(loader_iter)
 
-    from owl_vaes import from_pretrained
+    for i in range(n_batches - 2):
+        start = time.time()
+        batch_rgb, batch_depth = next(loader_iter)
+        end = time.time()
+        times.append(end - start)
+        print(f"Batch {i+1} loaded in {times[-1]:.4f} seconds")
 
-    model = from_pretrained("configs/cod_yt_v2/base.yml", "dec_64x_depth_515k.pt")
-    enc = model.encoder.cuda().bfloat16()
-    model = model.decoder.cuda().bfloat16()
-
-    # Prepare encoder input: concatenate RGB and depth, normalize to [-1, 1]
-    enc_in = torch.cat([
-        batch_rgb[:4,0].cuda().bfloat16() / 127.5 - 1,
-        batch_depth[:4,0].cuda().bfloat16() / 127.5 - 1
-    ], dim=1)
-
-    with torch.no_grad():
-        z = enc(enc_in)[0]
-        rec = model(z)
-        draw_tensor(rec)
+    avg_time = sum(times) / len(times)
+    print(f"Average batch load time (excluding first 2): {avg_time:.4f} seconds over {len(times)} batches")

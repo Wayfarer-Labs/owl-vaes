@@ -113,9 +113,7 @@ class CausalDiffusionDecoderTrainer(BaseTrainer):
             self.model = DDP(self.model)
 
         self.encoder = self.encoder.to(self.device).bfloat16().train()
-        
         freeze(self.encoder)
-        self.encoder = torch.compile(self.encoder, dynamic=False,fullgraph=True)
 
         self.ema = EMA(
             self.model,
@@ -142,6 +140,8 @@ class CausalDiffusionDecoderTrainer(BaseTrainer):
         ctx = torch.amp.autocast(self.device, torch.bfloat16)
 
         self.load()
+        torch.cuda.empty_cache()
+        gc.collect()
 
         # Timer reset
         timer = Timer()
@@ -161,22 +161,24 @@ class CausalDiffusionDecoderTrainer(BaseTrainer):
         sample_loader = iter(sample_loader)
         sampler = SameNoiseSampler(self.train_cfg.sampling_steps)
 
+        @torch.no_grad()
+        def sample_from_teacher(batch_rgb, batch_depth):
+            t_input = torch.cat([batch_rgb, batch_depth], dim=1).cuda().bfloat16()
+            t_mu, t_logvar = self.encoder(t_input)
+            t_std = (t_logvar/2).exp()
+            t_z = torch.randn_like(t_mu) * t_std + t_mu
+            t_z = t_z / self.train_cfg.latent_scale
+            return t_z
+
+        sample_from_teacher = torch.compile(sample_from_teacher, mode = 'max-autotune', dynamic=False, fullgraph=True)
+
         local_step = 0
         for _ in range(self.train_cfg.epochs):
             for batch_rgb, batch_depth in loader:
                 batch_rgb = batch_rgb.to(self.device) # b3hw
                 batch_depth = batch_depth.to(self.device) # b1hw
                 
-                # Assumption is that it's already the right size for the teacher
-                t_input = torch.cat([batch_rgb, batch_depth], dim=1).cuda().bfloat16()
-
-
-
-                with torch.no_grad():
-                    t_mu, t_logvar = self.encoder(t_input)
-                    t_std = (t_logvar/2).exp()
-                    t_z = torch.randn_like(t_mu) * t_std + t_mu
-                    t_z = t_z / self.train_cfg.latent_scale
+                t_z = sample_from_teacher(batch_rgb, batch_depth)
 
                 with ctx:
                     diff_loss = self.model(batch_rgb, t_z)
@@ -231,12 +233,14 @@ class CausalDiffusionDecoderTrainer(BaseTrainer):
                                 else:
                                     # For single device, add batch dimension to match ema_rec
                                     sample_rgb_gathered = sample_rgb.unsqueeze(0)
+                                    ema_rec = ema_rec.unsqueeze(0)
+                            if self.rank == 0:
+                                wandb_dict['samples'] = to_wandb_video_sidebyside(
+                                    sample_rgb_gathered.detach().contiguous().bfloat16(),
+                                    ema_rec.detach().contiguous().bfloat16()
+                                )
+
                         if self.rank == 0:
-                            wandb_dict['samples'] = to_wandb_video_sidebyside(
-                                sample_rgb_gathered.detach().contiguous().bfloat16(),
-                                ema_rec.detach().contiguous().bfloat16()
-                            )
-                            torch.save(sample_rgb_gathered.detach().contiguous().bfloat16(), "sample_rgb.pt")
                             wandb.log(wandb_dict)
 
                     self.total_step_counter += 1
@@ -245,6 +249,3 @@ class CausalDiffusionDecoderTrainer(BaseTrainer):
                             self.save()
 
                     self.barrier()
-
-                    gc.collect()
-                    torch.cuda.empty_cache()
