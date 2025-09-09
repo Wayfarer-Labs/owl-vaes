@@ -6,6 +6,8 @@ from owl_vaes.configs import Config
 from owl_vaes.trainers import get_trainer_cls
 from owl_vaes.utils.ddp import cleanup, setup
 
+from dotenv import load_dotenv
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
@@ -14,6 +16,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     cfg = Config.from_yaml(args.config_path)
+    load_dotenv()
 
     global_rank, local_rank, world_size = setup()
     print(f"Global rank: {global_rank}, Local rank: {local_rank}, World size: {world_size}")
