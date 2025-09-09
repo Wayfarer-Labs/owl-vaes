@@ -8,9 +8,12 @@ from ..nn.resnet import (
     DownBlock, SameBlock, UpBlock,
     LandscapeToSquare, SquareToLandscape
 )
-from ..nn.sana import ChannelToSpace, SpaceToChannel
+from ..nn.sana import (
+    ChannelToSpace, SpaceToChannel,
+    ChannelAverage, ChannelDuplication
+)
 
-from torch.nn.utils.parametrizations import weight_norm
+from ..nn.resnet import WeightNormConv2d
 from torch.utils.checkpoint import checkpoint
 import torch.distributions as dist
 
@@ -24,7 +27,7 @@ class Encoder(nn.Module):
         ch_max = config.ch_max
         self.skip_logvar = getattr(config, "skip_logvar", False)
 
-        self.conv_in = weight_norm(nn.Conv2d(config.channels, ch_0, 3, 1, 1))
+        self.conv_in = WeightNormConv2d(config.channels, ch_0, 3, 1, 1)
 
         blocks = []
         residuals = []
@@ -48,8 +51,11 @@ class Encoder(nn.Module):
         self.residuals = nn.ModuleList(residuals)
 
         self.avg_factor = ch // config.latent_channels
-        self.conv_out = weight_norm(nn.Conv2d(ch, config.latent_channels, 1, 1, 0))
-        self.conv_out_logvar = weight_norm(nn.Conv2d(ch, config.latent_channels, 1, 1, 0)) if not self.skip_logvar else None
+        
+        self.conv_out = ChannelAverage(ch, config.latent_channels)
+        #self.conv_out = weight_norm(nn.Conv2d(ch, config.latent_channels, 3, 1, 1))
+        
+        self.conv_out_logvar = WeightNormConv2d(ch, config.latent_channels, 3, 1, 1) if not self.skip_logvar else None
 
     @torch.no_grad()
     def sample(self, x):
@@ -62,15 +68,9 @@ class Encoder(nn.Module):
             res = shortcut(x)
             x = block(x) + res
 
-        res = x.clone()
-        # Replace einops reduce with reshape + mean
-        b, c, h, w = res.shape
-        res = res.reshape(b, self.avg_factor, c//self.avg_factor, h, w)
-        res = res.mean(dim=1)
-        
         if self.use_middle_block:
-            x = self.middle_block(x)
-        mu = self.conv_out(x) + res
+            x = self.middle_block(x) + x
+        mu = self.conv_out(x)
 
         if not self.training:
             return mu
@@ -94,7 +94,8 @@ class Decoder(nn.Module):
         ch_max = config.ch_max
 
         self.rep_factor = ch_max // config.latent_channels
-        self.conv_in = weight_norm(nn.Conv2d(config.latent_channels, ch_max, 1, 1, 0))
+        self.conv_in = ChannelDuplication(config.latent_channels, ch_max)
+        #self.conv_in = weight_norm(nn.Conv2d(config.latent_channels, ch_max, 3, 1, 1))
 
         blocks = []
         residuals = []
@@ -117,20 +118,16 @@ class Decoder(nn.Module):
         self.blocks = nn.ModuleList(list(reversed(blocks)))
         self.residuals = nn.ModuleList(list(reversed(residuals)))
 
-        self.conv_out = weight_norm(nn.Conv2d(ch_0, config.channels, 3, 1, 1, bias = False))
+        self.conv_out = WeightNormConv2d(ch_0, config.channels, 3, 1, 1)
         self.act_out = nn.SiLU()
 
         self.decoder_only = decoder_only
 
     def forward(self, x):
-        res = x.clone()
-        rep_res = res.repeat(1, self.rep_factor, 1, 1)
-
         x = self.conv_in(x)
-        x = x + rep_res
 
         if self.use_middle_block:
-            x = self.middle_block(x)
+            x = self.middle_block(x) + x
 
         for (block, shortcut) in zip(self.blocks, self.residuals):
             x = block(x) + shortcut(x)
@@ -192,27 +189,19 @@ class DCAE(nn.Module):
         return rec, mu, logvar
 
 def dcae_test():
-    from ..configs import ResNetConfig
+    from ..configs import Config
 
-    cfg = ResNetConfig(
-        sample_size=256,
-        channels=3,
-        latent_size=32,
-        latent_channels=4,
-        noise_decoder_inputs=0.0,
-        ch_0=32,
-        ch_max=128,
-        encoder_blocks_per_stage = [2,2,2,2],
-        decoder_blocks_per_stage = [2,2,2,2]
-    )
+    cfg = Config.from_yaml("configs/waypoint_1/base.yml").model
 
     model = DCAE(cfg).bfloat16().cuda()
-    with torch.no_grad():
-        x = torch.randn(1, 3, 256, 256).bfloat16().cuda()
-        rec, z, down_rec = model(x)
-        assert rec.shape == (1, 3, 256, 256), f"Expected shape (1,3,256,256), got {rec.shape}"
-        assert z.shape == (1, 4, 32, 32), f"Expected shape (1,4,32,32), got {z.shape}"
-        assert down_rec.shape == (1, 3, 128, 128), f"Expected shape (1,3,128,128), got {down_rec.shape}"
+    model = torch.compile(model)
+    x = torch.randn(1, 4, 512, 512).bfloat16().cuda()
+    x.requires_grad_(True)
+    rec, z, _ = model(x)
+    assert rec.shape == (1, 4, 512, 512), f"Expected shape (1,4,512,512), got {rec.shape}"
+    assert z.shape == (1, 64, 16, 16), f"Expected shape (1,64,16,16), got {z.shape}"
+    loss = torch.nn.functional.mse_loss(rec, x)
+    loss.backward()
     print("Test passed!")
     
 if __name__ == "__main__":

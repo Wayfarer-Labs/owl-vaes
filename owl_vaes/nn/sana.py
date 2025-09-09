@@ -1,12 +1,14 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.nn.utils.parametrizations import weight_norm
 
 import einops as eo
 
 from .attn import Attn
 from ..configs import TransformerConfig
 from .normalization import LayerNorm
+from .resnet import WeightNormConv2d
 
 """
 Building blocks for SANA modules and residuals
@@ -15,35 +17,58 @@ Building blocks for SANA modules and residuals
 class SpaceToChannel(nn.Module):
     def __init__(self, ch_in, ch_out):
         super().__init__()
-        if ch_in == ch_out:
-            self.reps = 4
-        else:
-            self.reps = 2
+
+        self.proj = WeightNormConv2d(ch_in, ch_out // 4, 3, 1, 1)
 
     def forward(self, x):
-        # [c,2h,2w] -> [4c,h,w]
-        x = F.pixel_unshuffle(x, downscale_factor=2)
-        # [4c,h,w] -> [2c,h,w]
-        b, c, h, w = x.shape
-        x = x.view(b, self.reps, c//self.reps, h, w)
-        x = x.mean(dim=1)
+        x = self.proj(x.contiguous()) # [c_in, h, w] -> [c_out // 4, h, w]
+        x = F.pixel_unshuffle(x, 2) # [c_out // 4, h, w] -> [c_out, h // 2, w // 2]
         return x
 
 class ChannelToSpace(nn.Module):
     def __init__(self, ch_in, ch_out):
         super().__init__()
-        if ch_in == ch_out:
-            self.reps = 4
-        else:
-            self.reps = 2
+
+        self.proj = WeightNormConv2d(ch_in, 4 * ch_out, 3, 1, 1)
 
     def forward(self, x):
-        # [4c, h, w] -> [c, 2h, 2w]
-        x = F.pixel_shuffle(x, upscale_factor=2)
-        # [c, 2h, 2w] -> [2c, 2h, 2w]
-        b, c, h, w = x.shape
-        x = x.repeat(1, self.reps, 1, 1)
+        x = self.proj(x.contiguous()) # [c_in, h, w] -> [4 * c_out, h, w]
+        x = F.pixel_shuffle(x, 2) # [4 * c_out, h, w] -> [c_out, 2h, 2w]
         return x
+
+class ChannelAverage(nn.Module):
+    def __init__(self, ch_in, ch_out):
+        super().__init__()
+
+        self.proj = WeightNormConv2d(ch_in, ch_out, 3, 1, 1)
+        self.grps = ch_in // ch_out
+        self.scale = (self.grps) ** 0.5
+    
+    def forward(self, x):
+        res = x.clone()
+        x = self.proj(x.contiguous()) # [b, ch_out, h, w]
+
+        # Residual goes through channel avg
+        res = res.view(res.shape[0], self.grps, res.shape[1] // self.grps, res.shape[2], res.shape[3]).contiguous()
+        res = res.mean(dim=1) * self.scale # [b, ch_out, h, w]
+        
+        return res + x
+
+class ChannelDuplication(nn.Module):
+    def __init__(self, ch_in, ch_out):
+        super().__init__()
+
+        self.proj = WeightNormConv2d(ch_in, ch_out, 3, 1, 1)
+        self.reps = ch_out // ch_in
+        self.scale = (self.reps) ** -0.5
+
+    def forward(self, x):
+        res = x.clone()
+        x = self.proj(x.contiguous())
+
+        res = res.repeat_interleave(self.reps, dim = 1).contiguous() * self.scale
+
+        return res + x
 
 class ResidualAttn(nn.Module):
     def __init__(self, ch):

@@ -10,6 +10,9 @@ from torch.nn.utils.parametrizations import weight_norm
 Building blocks for any ResNet based model
 """
 
+def WeightNormConv2d(*args, **kwargs):
+    return weight_norm(nn.Conv2d(*args, **kwargs))
+
 def checkpoint(function, *args, **kwargs):
     kwargs.setdefault("use_reentrant", False)
     return torch_checkpoint(function, *args, **kwargs)
@@ -21,24 +24,26 @@ class ResBlock(nn.Module):
     :param ch: Channel count to use for the block
     :param total_res_blocks: How many res blocks are there in the entire model?
     """
-    def __init__(self, ch, total_res_blocks):
+    def __init__(self, ch, total_res_blocks, use_checkpoint = False):
         super().__init__()
 
         grp_size = 16
         n_grps = (2*ch) // grp_size
 
-        self.conv1 = weight_norm(nn.Conv2d(ch, 2*ch, 1, 1, 0))
+        self.conv1 = WeightNormConv2d(ch, 2*ch, 1, 1, 0)
         #self.norm1 = RMSNorm2d(2*ch)
         #self.norm1 = GroupNorm(2*ch, n_grps)
 
-        self.conv2 = weight_norm(nn.Conv2d(2*ch, 2*ch, 3, 1, 1, groups = n_grps))
+        self.conv2 = WeightNormConv2d(2*ch, 2*ch, 3, 1, 1, groups = n_grps)
         #self.norm2 = RMSNorm2d(2*ch)
         #self.norm2 = GroupNorm(2*ch, n_grps)
 
-        self.conv3 = weight_norm(nn.Conv2d(2*ch, ch, 1, 1, 0, bias=False))
+        self.conv3 = WeightNormConv2d(2*ch, ch, 1, 1, 0, bias=False)
 
         self.act1 = nn.LeakyReLU(inplace=True)
         self.act2 = nn.LeakyReLU(inplace=True)
+
+        self.use_checkpoint = use_checkpoint
 
         # Fix up init
         scaling_factor = total_res_blocks ** -.25
@@ -64,7 +69,7 @@ class ResBlock(nn.Module):
             x = self.conv3(x)
             return x
 
-        if self.training:
+        if self.training and self.use_checkpoint:
             x = checkpoint(_inner, x) + x.clone()
         else:
             x = _inner(x) + x.clone()
@@ -78,7 +83,7 @@ class Upsample(nn.Module):
     def __init__(self, ch_in, ch_out, stride = 2):
         super().__init__()
 
-        self.proj = nn.Sequential() if ch_in == ch_out else weight_norm(nn.Conv2d(ch_in, ch_out, 1, 1, 0, bias=False))
+        self.proj = nn.Sequential() if ch_in == ch_out else WeightNormConv2d(ch_in, ch_out, 1, 1, 0, bias=False)
         self.stride = stride
 
     def forward(self, x):
@@ -93,7 +98,7 @@ class Downsample(nn.Module):
     def __init__(self, ch_in, ch_out, stride = 2):
         super().__init__()
 
-        self.proj = weight_norm(nn.Conv2d(ch_in, ch_out, 1, 1, 0, bias=False))
+        self.proj = WeightNormConv2d(ch_in, ch_out, 1, 1, 0, bias=False)
         self.stride = stride
 
     def forward(self, x):
@@ -202,7 +207,7 @@ class LandscapeToSquare(nn.Module):
         self.target = find_nearest_square(h,w)
 
         if ch_out is None: ch_out = ch
-        self.proj = weight_norm(nn.Conv2d(ch, ch_out, 3, 1, 1, bias = False))
+        self.proj = WeightNormConv2d(ch, ch_out, 3, 1, 1, bias = False)
     
     def forward(self, x):
         # x is [9, 16]
@@ -217,7 +222,7 @@ class SquareToLandscape(nn.Module):
         self.target = tuple(landscape_size)
 
         if ch_out is None: ch_out = ch
-        self.proj = weight_norm(nn.Conv2d(ch, ch_out, 3, 1, 1, bias = False))
+        self.proj = WeightNormConv2d(ch, ch_out, 3, 1, 1, bias = False)
 
     def forward(self, x):
         # x is [1,1]

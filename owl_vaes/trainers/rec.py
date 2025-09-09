@@ -114,7 +114,7 @@ class RecTrainer(BaseTrainer):
         if self.crt is not None:
             self.crt = self.crt.cuda().train()
         if self.world_size > 1:
-            self.model = DDP(self.model, find_unused_parameters=True)
+            self.model = DDP(self.model, find_unused_parameters=(self.crt is not None))
             if self.crt is not None:
                 self.crt = DDP(self.crt, find_unused_parameters=True)
                 freeze(self.crt)
@@ -212,7 +212,9 @@ class RecTrainer(BaseTrainer):
                 with torch.no_grad():
                     metrics.log_dict({
                         'z_std' : z.std() / accum_steps,
-                        'z_shift' : z.mean() / accum_steps
+                        'z_shift' : z.mean() / accum_steps,
+                        'z_max' : z.max() / accum_steps,
+                        'z_min' : z.min() / accum_steps
                     })
 
                 local_step += 1

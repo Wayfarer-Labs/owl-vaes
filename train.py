@@ -16,6 +16,7 @@ if __name__ == "__main__":
     cfg = Config.from_yaml(args.config_path)
 
     global_rank, local_rank, world_size = setup()
+    print(f"Global rank: {global_rank}, Local rank: {local_rank}, World size: {world_size}")
 
     device = args.device
     if device is None:
