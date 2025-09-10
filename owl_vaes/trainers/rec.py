@@ -165,6 +165,8 @@ class RecTrainer(BaseTrainer):
         for _ in range(self.train_cfg.epochs):
             for batch in loader:
                 total_loss = 0.
+                if isinstance(batch,list) or isinstance(batch,tuple):
+                    batch = torch.cat(batch, dim=1)
                 batch = batch.to(self.device).bfloat16()
                 with ctx:
                     batch_rec, mu, logvar = self.model(batch)
