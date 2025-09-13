@@ -138,7 +138,7 @@ class Decoder(nn.Module):
         return x
 
 @torch.no_grad()
-def get_ch_prime(total_ch, min_ch=16, step=4):
+def get_ch_prime(total_ch, min_ch=32, step=8):
     """
     Returns an integer sampled from the sequence [min_ch, min_ch+step, ..., total_ch]
     (inclusive of total_ch if it lands on a step), and ensures the value is the same across all devices.
