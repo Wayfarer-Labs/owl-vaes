@@ -1,6 +1,6 @@
 model:
   model_id: dcae
-  sample_size: [256, 256]
+  sample_size: [512, 512]
   channels: 4
   latent_size: 16
   latent_channels: 64
@@ -8,29 +8,29 @@ model:
   ch_0: 256
   ch_max: 2048
 
-  encoder_blocks_per_stage: [4, 4, 4, 4, 4]
-  decoder_blocks_per_stage: [4, 4, 4, 4, 4]
+  encoder_blocks_per_stage: [4, 4, 8, 8, 8]
+  decoder_blocks_per_stage: [4, 4, 8, 8, 8]
 
   use_middle_block: false
-  do_channel_mask: true
+  do_channel_mask: false
 
 train:
   trainer_id: rec
-  data_id: s3_cod_features
+  data_id: local_cod_features
   data_kwargs:
-    bucket_name: cod-yt-frames-1080p
-    prefix: depth-and-rgb
-    include_depth: true
-    target_size: [256, 256]
+    root_dir: [/mnt/data/waypoint_1/normalized360, /mnt/data/datasets/cod_yt_latents]
+    mix_ratios: [0.95, 0.05]
+    include_suffixes: [rgb, depth]
+    target_size: [512, 512]
 
-  target_batch_size: 256
-  batch_size: 8
+  target_batch_size: 32
+  batch_size: 4
 
   epochs: 200
 
   opt: AdamW
   opt_kwargs:
-    lr: 5.0e-5
+    lr: 3.0e-5
     weight_decay: 1.0e-4
     betas: [0.9, 0.95]
     eps: 1.0e-15
@@ -45,15 +45,15 @@ train:
   scheduler: LinearWarmup
   scheduler_kwargs:
     warmup_steps: 3000
-    min_lr: 5.0e-6
+    min_lr: 3.0e-6
 
-  checkpoint_dir: checkpoints/waypoint_1_f32c64
-  resume_ckpt: null #checkpoints/waypoint_1_f32c32/step_100000.pt
+  checkpoint_dir: checkpoints/waypoint_1_f32c64_8res
+  resume_ckpt: checkpoints/waypoint_1_f32c64_8res/step_170000.pt
 
   sample_interval: 1000
   save_interval: 5000
 
 wandb:
-  name: ${env:WANDB_USER_NAME}
+  name: shahbuland
   project: new_vaes
-  run_name: waypoint_1_f32c64_4res
+  run_name: waypoint_1_f32c64_8res
