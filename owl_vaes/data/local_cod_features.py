@@ -25,6 +25,15 @@ def valid_data_test(tensor):
     # tensor is [n,c,h,w]
     return True
 
+def safe_normalize(tensor):
+    # tensor could be [-1,1], [0,1], [0,255]
+    if tensor.float().max() > 1.1: # [0,255]
+        return tensor.float().div_(127.5).sub_(1.0)
+    elif tensor.float().min() < -0.01: # [-1,1]
+        return tensor.float()
+    else: # [0,1]
+        return tensor.float().mul_(2.0).sub_(1.0)
+
 def augment_data(samples, target_size=(256,256)):
     # both are [c,h,w]
     # augments will be: horizontal flip and 
@@ -115,7 +124,8 @@ class LocalCoDDataset(IterableDataset):
                     if not os.path.exists(path):
                         continue
                     tuple_.append(path)
-                file_tuples.append(tuple_)  
+                if len(tuple_) == len(self.include_suffixes):
+                    file_tuples.append(tuple_)  
             self.file_tuples_per_dir.append(file_tuples)
             self.all_file_tuples.extend(file_tuples)
 
@@ -146,11 +156,11 @@ class LocalCoDDataset(IterableDataset):
 
                 tensors = [torch.load(f, map_location='cpu', mmap=True, weights_only=False) for f in file_tuple]
                 idx = random.randint(0, tensors[0].shape[0] - 1)
-                samples = [t[idx] for t in tensors]
+                samples = [safe_normalize(t[idx].clone().float().contiguous()) for t in tensors]
                 samples = torch.cat(samples, dim = 0) # Concatenate along channel dimension assumes rgb || depth || etc.
                 samples = augment_data(samples, self.target_size)
 
-                yield samples.float() / 127.5 - 1.0 # Concatenate along channel dimension assumes rgb || depth || etc.
+                yield samples
             except Exception as e:
                 print(f"Error loading {file_tuple}: {e}")
                 continue
@@ -163,10 +173,8 @@ if __name__ == "__main__":
     import time
     from owl_vaes.configs import Config
 
-    config_path = "configs/waypoint_1/base.yml"
+    config_path = "configs/waypoint_1/pose.yml"
     data_kwargs = Config.from_yaml(config_path).train.data_kwargs
-    data_kwargs['root_dir'] = '/mnt/data/datasets/cod_yt_latents'
-    data_kwargs['mix_ratios'] = None
 
     batch_size = 32
 
@@ -181,7 +189,8 @@ if __name__ == "__main__":
     times = []
     for i in range(n_batches):
         start = time.time()
-        batch = next(loader_iter)
+        batch = next(loader_iter)[:,-1]
+        print(batch.max(), batch.min(), batch.mean())
         end = time.time()
         times.append(end - start)
         if isinstance(batch, tuple):

@@ -16,7 +16,7 @@ from ..muon import init_muon
 from ..nn.lpips import get_lpips_cls
 from ..schedulers import get_scheduler_cls
 from ..utils import Timer, freeze, unfreeze
-from ..utils.logging import LogHelper, to_wandb, to_wandb_depth, to_wandb_flow
+from ..utils.logging import LogHelper, to_wandb, to_wandb_grayscale
 from .base import BaseTrainer
 from ..losses.basic import latent_reg_loss
 from ..losses.dwt import dwt_loss_fn
@@ -255,23 +255,24 @@ class RecTrainer(BaseTrainer):
                             
                             # Log depth maps if present (4 or 7 channels)
                             if batch.shape[1] >= 4:
-                                depth_samples = to_wandb_depth(
-                                    batch.detach().contiguous().bfloat16(),
-                                    batch_rec.detach().contiguous().bfloat16(),
+                                depth_samples = to_wandb_grayscale(
+                                    batch[:,3].unsqueeze(1).detach().contiguous().bfloat16(),
+                                    batch_rec[:,3].unsqueeze(1).detach().contiguous().bfloat16(),
                                     gather = False
                                 )
                                 if depth_samples:
                                     wandb_dict['depth_samples'] = depth_samples
                             
-                            # Log optical flow if present (7 channels)
-                            if batch.shape[1] >= 7:
-                                flow_samples = to_wandb_flow(
-                                    batch.detach().contiguous().bfloat16(),
-                                    batch_rec.detach().contiguous().bfloat16(),
+                            if batch.shape[1] == 5:
+                                # Pose
+                                pose_samples = to_wandb_grayscale(
+                                    batch[:,4].unsqueeze(1).detach().contiguous().bfloat16(),
+                                    batch_rec[:,4].unsqueeze(1).detach().contiguous().bfloat16(),
                                     gather = False
                                 )
-                                if flow_samples:
-                                    wandb_dict['flow_samples'] = flow_samples
+                                if pose_samples:
+                                    wandb_dict['pose_samples'] = pose_samples
+                        
                         if self.rank == 0:
                             wandb.log(wandb_dict)
 
