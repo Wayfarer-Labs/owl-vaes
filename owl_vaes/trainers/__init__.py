@@ -39,5 +39,8 @@ def get_trainer_cls(trainer_id: Literal["rec", "proxy", "audio_rec"]):
         case "dcae_tune":
             from .distill_dcae_test import DCAETuneTrainer
             return DCAETuneTrainer
+        case "caus_diffdec":
+            from .caus_diffdec_trainer import CausalDiffusionDecoderTrainer
+            return CausalDiffusionDecoderTrainer
         case _:
             raise NotImplementedError

@@ -1,0 +1,29 @@
+name: owl-vaes-multinode
+
+resources:
+  cloud: kubernetes
+  accelerators: H200:8
+  
+num_nodes: 4
+
+setup: |
+  sudo apt-get update
+  sudo apt-get install -y libgl1
+  
+run: |
+  cd /mnt/data/shahbuland
+  source venv/bin/activate
+  cd owl-vaes
+  
+  # Get the head node IP
+  MASTER_ADDR=$(echo "$SKYPILOT_NODE_IPS" | head -n1)
+  echo "Starting distributed training, head node: $MASTER_ADDR"
+  
+  # Run distributed training with torchrun
+  torchrun \
+    --nnodes=$SKYPILOT_NUM_NODES \
+    --nproc_per_node=$SKYPILOT_NUM_GPUS_PER_NODE \
+    --master_addr=$MASTER_ADDR \
+    --node_rank=${SKYPILOT_NODE_RANK} \
+    --master_port=8008 \
+    train.py --config_path configs/waypoint_1/base.yml

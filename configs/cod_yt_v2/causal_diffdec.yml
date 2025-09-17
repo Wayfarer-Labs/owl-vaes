@@ -1,0 +1,56 @@
+model:
+  model_id: diff_dec
+  sample_size: [360, 640]
+  channels: 3
+  latent_size: 8
+  latent_channels: 128
+  patch_size: [12,16]
+
+  n_layers: 24
+  n_heads: 24
+  d_model: 1536
+
+  causal: false
+  mimetic_init: false
+  block_size: null
+  backbone: dit
+  rope_impl: image+latent
+  dropout: 0.1
+
+train:
+  trainer_id: caus_diffdec
+  data_id: local_latent
+  data_kwargs:
+    root_dir: /mnt/data/datasets/cod_yt_latents
+    window_size: 1
+
+  target_batch_size: 256
+  batch_size: 32
+
+  epochs: 200
+
+  opt: AdamW
+  opt_kwargs:
+    lr: 1.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.95]
+    eps: 1.0e-15
+
+  scheduler: null
+
+  checkpoint_dir: checkpoints/diffdec_cod_yt_causal
+  resume_ckpt: checkpoints/diffdec_cod_yt_causal/step_20000.pt
+
+  sample_interval: 1000
+  save_interval: 10000
+
+  teacher_ckpt: checkpoints/cod_yt_v2/step_515000.pt
+  teacher_cfg: configs/cod_yt_v2/base.yml
+
+  latent_scale: 0.65
+  sampling_steps: 20
+
+wandb:
+  name: ${env:WANDB_USER_NAME}
+  project: new_vaes
+  run_name: diffdec_tune_yt_2

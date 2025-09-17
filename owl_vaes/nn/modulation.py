@@ -5,11 +5,14 @@ import torch.nn.functional as F
 from .normalization import LayerNorm
 
 class AdaLN(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim_in, dim_out = None):
         super().__init__()
 
-        self.fc = nn.Linear(dim, 2 * dim)
-        self.norm = LayerNorm(dim)
+        if dim_out is None:
+            dim_out = dim_in
+
+        self.fc = nn.Linear(dim_in, 2 * dim_out)
+        self.norm = LayerNorm(dim_out)
 
     def forward(self, x, cond):
         # x is [b,n,d]
@@ -25,10 +28,13 @@ class AdaLN(nn.Module):
         return x
 
 class Gate(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim_in, dim_out = None):
+        if dim_out is None:
+            dim_out = dim_in
+
         super().__init__()
 
-        self.fc_c = nn.Linear(dim, dim)
+        self.fc_c = nn.Linear(dim_in, dim_out)
 
     def forward(self, x, cond):
         # x is [b,n,d]

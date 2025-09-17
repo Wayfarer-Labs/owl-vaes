@@ -43,10 +43,10 @@ train:
     warmup_steps: 1500
     min_lr: 1.0e-5
 
-  checkpoint_dir: checkpoints/cod_yt_v2
+  checkpoint_dir: checkpoints/cod_yt_v2_enc_dist
   teacher_ckpt: checkpoints/cod_yt_v2/step_515000.pt
   teacher_cfg: configs/cod_yt_v2/base.yml
-  resume_ckpt: null
+  resume_ckpt: checkpoints/cod_yt_v2/step_20000.pt
 
   sample_interval: 500
   save_interval: 5000
@@ -56,4 +56,4 @@ train:
 wandb:
   name: ${env:WANDB_USER_NAME}
   project: new_vaes
-  run_name: feats_distill_enc
+  run_name: cod_yt_v2_enc_dist

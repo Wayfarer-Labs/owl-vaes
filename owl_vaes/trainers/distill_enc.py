@@ -14,8 +14,9 @@ from ema_pytorch import EMA
 from ..data import get_loader
 from ..models import get_model_cls
 from ..muon import init_muon
+from ..nn.lpips import get_lpips_cls
 from ..utils import Timer, freeze, versatile_load
-from ..utils.logging import LogHelper, to_wandb, to_wandb_depth, to_wandb_flow
+from ..utils.logging import LogHelper, to_wandb, to_wandb_grayscale
 from .base import BaseTrainer
 from ..configs import Config
 
@@ -106,6 +107,10 @@ class DistillEncTrainer(BaseTrainer):
         
         self.teacher_decoder = self.teacher_decoder.to(self.device).bfloat16().eval()
         freeze(self.teacher_decoder)
+        self.teacher_decoder = torch.compile(self.teacher_decoder)#, mode='max-autotune', dynamic=False, fullgraph=True)
+
+        lpips = get_lpips_cls(self.train_cfg.lpips_type)(self.device).to(self.device).eval()
+        freeze(lpips)
 
         self.ema = EMA(
             self.model,
@@ -141,6 +146,31 @@ class DistillEncTrainer(BaseTrainer):
         # Dataset setup
         loader = get_loader(self.train_cfg.data_id, self.train_cfg.batch_size, **self.train_cfg.data_kwargs)
 
+        if isinstance(self.train_cfg.latent_scale, (list, tuple)):
+            self.train_cfg.latent_scale = torch.Tensor(self.train_cfg.latent_scale)
+
+        def divide_latent_scale(latent):
+            if isinstance(self.train_cfg.latent_scale, torch.Tensor):
+                # latent is b c h w
+                # latent scale [c,]
+                shift = self.train_cfg.latent_shift.unsqueeze(0).unsqueeze(2).unsqueeze(3)
+                scale = self.train_cfg.latent_scale.unsqueeze(0).unsqueeze(2).unsqueeze(3)
+                return (latent - shift) / scale
+            else:
+                return (latent - self.train_cfg.latent_shift) / self.train_cfg.latent_scale
+            
+        def multiply_latent_scale(latent):
+            if isinstance(self.train_cfg.latent_scale, torch.Tensor):
+                # latent is b c h w
+                # latent scale [c,]
+                shift = self.train_cfg.latent_shift.unsqueeze(0).unsqueeze(2).unsqueeze(3)
+                scale = self.train_cfg.latent_scale.unsqueeze(0).unsqueeze(2).unsqueeze(3)
+                return (latent * scale) + shift
+            else:
+                shift = self.train_cfg.latent_shift
+                scale = self.train_cfg.latent_scale
+                return (latent * scale) + shift
+
         local_step = 0
         for _ in range(self.train_cfg.epochs):
             for batch in loader:
@@ -149,18 +179,19 @@ class DistillEncTrainer(BaseTrainer):
 
                 with ctx:
                     with torch.no_grad():
-                        teacher_z = self.teacher_encoder(batch) / self.train_cfg.latent_scale
+                        teacher_z = self.teacher_encoder(batch)
+                        target = divide_latent_scale(teacher_z)
                     
-                    student_z = self.model(batch[:,:student_ch]) / self.train_cfg.latent_scale
+                    student_z = self.model(batch[:,:student_ch])
 
                     # Loss computation
                     if l2_weight > 0.0:
-                        l2_loss = F.mse_loss(student_z, teacher_z) / accum_steps
+                        l2_loss = F.mse_loss(student_z, target) / accum_steps
                         total_loss += l2_loss * l2_weight
                         metrics.log('l2_loss', l2_loss)
                     
                     if l1_weight > 0.0:
-                        l1_loss = F.l1_loss(student_z, teacher_z) / accum_steps
+                        l1_loss = F.l1_loss(student_z, target) / accum_steps
                         total_loss += l1_loss * l1_weight
                         metrics.log('l1_loss', l1_loss)
 
@@ -190,39 +221,41 @@ class DistillEncTrainer(BaseTrainer):
                         wandb_dict['lr'] = self.opt.param_groups[0]['lr']
                         timer.reset()
 
+                        student_z = student_z.clone()
+
+                        #if True: # Logging LPIPs, might slow shit down
+                        #    with ctx:
+                        #        student_rec = self.teacher_decoder(
+                        #            multiply_latent_scale(student_z)
+                        #        )
+                        #        lpips_loss = lpips(student_rec, batch[:,:3])
+                        #        wandb_dict['lpips_loss'] = lpips_loss.item()
+
+
                         if self.total_step_counter % self.train_cfg.sample_interval == 0:
                             with ctx:
-                                teacher_latent = self.teacher_encoder(batch)
-                                student_latent = self.ema.ema_model(batch[:,:student_ch]) * self.train_cfg.latent_scale
+                                teacher_latent = self.teacher_encoder(batch).clone()
+                                student_latent = self.ema.ema_model(batch[:,:student_ch]).clone()
+                                student_latent = multiply_latent_scale(student_latent)
                                 
-                                teacher_rec = self.teacher_decoder(teacher_latent)
-                                student_rec = self.teacher_decoder(student_latent)
+                                teacher_rec = self.teacher_decoder(teacher_latent.detach().clone()).clone()
+                                student_rec = self.teacher_decoder(student_latent.detach().clone()).clone()
 
                             wandb_dict['samples'] = to_wandb(
-                                teacher_rec.detach().contiguous().bfloat16(),
-                                student_rec.detach().contiguous().bfloat16(),
+                                teacher_rec[:,:3].detach().contiguous().bfloat16(),
+                                student_rec[:,:3].detach().contiguous().bfloat16(),
                                 gather = False
                             )
 
                             # Log depth maps if present (4 or 7 channels)
                             if batch.shape[1] >= 4:
-                                depth_samples = to_wandb_depth(
-                                    teacher_rec.detach().contiguous().bfloat16(),
-                                    student_rec.detach().contiguous().bfloat16(),
+                                depth_samples = to_wandb_grayscale(
+                                    teacher_rec[:,3].unsqueeze(1).detach().contiguous().bfloat16(),
+                                    student_rec[:,3].unsqueeze(1).detach().contiguous().bfloat16(),
                                     gather = False
                                 )
                                 if depth_samples:
                                     wandb_dict['depth_samples'] = depth_samples
-                            
-                            # Log optical flow if present (7 channels)
-                            if batch.shape[1] >= 7:
-                                flow_samples = to_wandb_flow(
-                                    teacher_rec.detach().contiguous().bfloat16(),
-                                    student_rec.detach().contiguous().bfloat16(),
-                                    gather = False
-                                )
-                                if flow_samples:
-                                    wandb_dict['flow_samples'] = flow_samples
 
                         if self.rank == 0:
                             wandb.log(wandb_dict)

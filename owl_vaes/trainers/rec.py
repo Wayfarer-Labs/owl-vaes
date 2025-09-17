@@ -16,7 +16,7 @@ from ..muon import init_muon
 from ..nn.lpips import get_lpips_cls
 from ..schedulers import get_scheduler_cls
 from ..utils import Timer, freeze, unfreeze
-from ..utils.logging import LogHelper, to_wandb, to_wandb_depth, to_wandb_flow
+from ..utils.logging import LogHelper, to_wandb, to_wandb_grayscale
 from .base import BaseTrainer
 from ..losses.basic import latent_reg_loss
 from ..losses.dwt import dwt_loss_fn
@@ -56,6 +56,8 @@ class RecTrainer(BaseTrainer):
         if self.train_cfg.loss_weights.get('crt', 0.0) > 0.0:
             self.crt = CRT(self.model_cfg.latent_channels)
             self.crt_opt = None
+
+        self.do_channel_mask = getattr(self.train_cfg, 'channel_mask', False)
 
     def save(self):
         save_dict = {
@@ -112,7 +114,7 @@ class RecTrainer(BaseTrainer):
         if self.crt is not None:
             self.crt = self.crt.cuda().train()
         if self.world_size > 1:
-            self.model = DDP(self.model, find_unused_parameters=True)
+            self.model = DDP(self.model, find_unused_parameters=(self.crt is not None))
             if self.crt is not None:
                 self.crt = DDP(self.crt, find_unused_parameters=True)
                 freeze(self.crt)
@@ -163,6 +165,8 @@ class RecTrainer(BaseTrainer):
         for _ in range(self.train_cfg.epochs):
             for batch in loader:
                 total_loss = 0.
+                if isinstance(batch,list) or isinstance(batch,tuple):
+                    batch = torch.cat(batch, dim=1)
                 batch = batch.to(self.device).bfloat16()
                 with ctx:
                     batch_rec, mu, logvar = self.model(batch)
@@ -210,7 +214,9 @@ class RecTrainer(BaseTrainer):
                 with torch.no_grad():
                     metrics.log_dict({
                         'z_std' : z.std() / accum_steps,
-                        'z_shift' : z.mean() / accum_steps
+                        'z_shift' : z.mean() / accum_steps,
+                        'z_max' : z.max() / accum_steps,
+                        'z_min' : z.min() / accum_steps
                     })
 
                 local_step += 1
@@ -249,23 +255,24 @@ class RecTrainer(BaseTrainer):
                             
                             # Log depth maps if present (4 or 7 channels)
                             if batch.shape[1] >= 4:
-                                depth_samples = to_wandb_depth(
-                                    batch.detach().contiguous().bfloat16(),
-                                    batch_rec.detach().contiguous().bfloat16(),
+                                depth_samples = to_wandb_grayscale(
+                                    batch[:,3].unsqueeze(1).detach().contiguous().bfloat16(),
+                                    batch_rec[:,3].unsqueeze(1).detach().contiguous().bfloat16(),
                                     gather = False
                                 )
                                 if depth_samples:
                                     wandb_dict['depth_samples'] = depth_samples
                             
-                            # Log optical flow if present (7 channels)
-                            if batch.shape[1] >= 7:
-                                flow_samples = to_wandb_flow(
-                                    batch.detach().contiguous().bfloat16(),
-                                    batch_rec.detach().contiguous().bfloat16(),
+                            if batch.shape[1] == 5:
+                                # Pose
+                                pose_samples = to_wandb_grayscale(
+                                    batch[:,4].unsqueeze(1).detach().contiguous().bfloat16(),
+                                    batch_rec[:,4].unsqueeze(1).detach().contiguous().bfloat16(),
                                     gather = False
                                 )
-                                if flow_samples:
-                                    wandb_dict['flow_samples'] = flow_samples
+                                if pose_samples:
+                                    wandb_dict['pose_samples'] = pose_samples
+                        
                         if self.rank == 0:
                             wandb.log(wandb_dict)
 

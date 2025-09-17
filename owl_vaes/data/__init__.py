@@ -25,6 +25,12 @@ def get_loader(data_id: str, batch_size: int, **data_kwargs):
         from .s3_cod_features import get_loader
         #from .s3_cod_features_shuffle import get_loader
         return get_loader(batch_size, **data_kwargs)
+    if data_id == "local_cod_features":
+        from .local_cod_features import get_loader
+        return get_loader(batch_size, **data_kwargs)
     if data_id == "local_wf_data":
         from .local_wf_data import get_loader
+        return get_loader(batch_size, **data_kwargs)
+    if data_id == "local_latent":
+        from .local_diffdec_pairs import get_loader
         return get_loader(batch_size, **data_kwargs)

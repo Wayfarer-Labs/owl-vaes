@@ -29,11 +29,14 @@ class DiffusionDecoderCore(nn.Module):
         super().__init__()
 
         size = config.sample_size
-        n_tokens = size[0] // config.patch_size * size[1] // config.patch_size
+        patch_size = config.patch_size
+        if isinstance(patch_size, int):
+            patch_size = [patch_size, patch_size]
+        n_tokens = size[0] // patch_size[0] * size[1] // patch_size[1]
 
-        self.proj_in = nn.Linear(config.patch_size * config.patch_size * config.channels, config.d_model, bias = False)
+        self.proj_in = nn.Linear(patch_size[0] * patch_size[1] * config.channels, config.d_model, bias = False)
 
-        self.proj_out = nn.Linear(config.d_model, config.patch_size * config.patch_size * config.channels, bias = False)
+        self.proj_out = nn.Linear(config.d_model, patch_size[0] * patch_size[1] * config.channels, bias = False)
 
         self.ts_embed = TimestepEmbedding(config.d_model)
         
@@ -41,14 +44,13 @@ class DiffusionDecoderCore(nn.Module):
 
         self.rope_impl = getattr(config, "rope_impl", None)
         if self.rope_impl is None:
-            self.pos_enc_x = LearnedPosEnc(n_tokens, config.d_model)
-            self.pos_enc_z = LearnedPosEnc(config.latent_size**2, config.d_model)
-        
+            raise ValueError("rope_impl must be set; learned positional encodings are no longer supported.")
+
         self.final = FinalLayer(config, skip_proj = True)
 
-        self.p = config.patch_size
-        self.n_p_y = config.sample_size[0] // self.p
-        self.n_p_x = config.sample_size[1] // self.p
+        self.p_y, self.p_x = patch_size
+        self.n_p_y = config.sample_size[0] // self.p_y
+        self.n_p_x = config.sample_size[1] // self.p_x
 
         if config.backbone == "dit":
             self.blocks = DiT(config)
@@ -67,19 +69,18 @@ class DiffusionDecoderCore(nn.Module):
 
         # Convert from image format [b,c,h,w] to patches [b,n_patches,patch_size*patch_size*c]
         b, c, h, w = x.shape
-        x = x.view(b, c, self.n_p_y, self.p, self.n_p_x, self.p)
+        x = x.view(b, c, self.n_p_y, self.p_y, self.n_p_x, self.p_x)
         x = x.permute(0, 2, 4, 3, 5, 1).contiguous()
-        x = x.view(b, self.n_p_y * self.n_p_x, self.p * self.p * c)
+        x = x.view(b, self.n_p_y * self.n_p_x, self.p_y * self.p_x * c)
+
         x = self.proj_in(x) # -> [b,n,d]
-        if self.rope_impl is None:
-            x = self.pos_enc_x(x)
+        # No learned positional encoding
 
         # Flatten spatial dimensions: [b,c,h,w] -> [b,h*w,c]
         b, c, h, w = z.shape
         z = z.permute(0, 2, 3, 1).contiguous().view(b, h * w, c)
         z = self.proj_in_z(z)
-        if self.rope_impl is None:
-            z = self.pos_enc_z(z)
+        # No learned positional encoding
         
         n = x.shape[1]
         x = torch.cat([x,z],dim=1)
@@ -91,10 +92,10 @@ class DiffusionDecoderCore(nn.Module):
         x = self.proj_out(x)
         # Convert from patches back to image format [b,n_patches,patch_size*patch_size*c] -> [b,c,h,w]
         b, n_patches, patch_dim = x.shape
-        c = patch_dim // (self.p * self.p)
-        x = x.view(b, self.n_p_y, self.n_p_x, self.p, self.p, c)
+        c = patch_dim // (self.p_y * self.p_x)
+        x = x.view(b, self.n_p_y, self.n_p_x, self.p_y, self.p_x, c)
         x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
-        x = x.view(b, c, self.n_p_y * self.p, self.n_p_x * self.p).contiguous()
+        x = x.view(b, c, self.n_p_y * self.p_y, self.n_p_x * self.p_x).contiguous()
 
         return x
 
@@ -134,10 +135,11 @@ class DiffusionDecoder(nn.Module):
 if __name__ == "__main__":
     from ..configs import Config
 
-    cfg = Config.from_yaml("configs/diffdec.yml").model
+    cfg = Config.from_yaml("configs/cod_yt_v2/causal_diffdec.yml").model
     model = DiffusionDecoderCore(cfg).bfloat16().cuda()
-    z = torch.randn(1,128,4,4).bfloat16().cuda()
+    x = torch.randn(1,3,360,640).bfloat16().cuda()
+    z = torch.randn(1,128,8,8).bfloat16().cuda()
     with torch.no_grad():
-        y = model.sample(z)
+        y = model(x, z, torch.tensor([0.5]).cuda().bfloat16())
         print(y.shape)
     print(cfg)

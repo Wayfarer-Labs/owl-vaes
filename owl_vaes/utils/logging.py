@@ -70,16 +70,10 @@ def to_wandb(x1, x2, gather = False):
     x = x.permute(0,2,3,1).numpy().astype(np.uint8) # [b,c,h,w] -> [b,h,w,c]
     return [wandb.Image(img) for img in x]
 
-def to_wandb_depth(x1, x2, gather = False):
+def to_wandb_grayscale(grayscale1, grayscale2, gather = False):
     # Extract depth channel (channel 3) from 4 or 7 channel images
-    # x1, x2 both is [b,c,h,w] where c >= 4
-    if x1.shape[1] < 4 or x2.shape[1] < 4:
-        return []
     
-    depth1 = x1[:,3:4] # Keep as single channel
-    depth2 = x2[:,3:4]
-    
-    x = torch.cat([depth1, depth2], dim = -1) # side to side
+    x = torch.cat([grayscale1, grayscale2], dim = -1) # side to side
     x = x.clamp(-1, 1)
 
     if dist.is_initialized() and gather:
@@ -92,27 +86,6 @@ def to_wandb_depth(x1, x2, gather = False):
     # Convert single channel to grayscale images
     x = x.squeeze(-1) if x.shape[-1] == 1 else x
     return [wandb.Image(img, mode='L') for img in x]
-
-def to_wandb_flow(x1, x2, gather = False):
-    # Extract optical flow channels (channels 4-6) from 7 channel images
-    # x1, x2 both is [b,c,h,w] where c >= 7
-    if x1.shape[1] < 7 or x2.shape[1] < 7:
-        return []
-    
-    flow1 = x1[:,4:7] # RGB optical flow
-    flow2 = x2[:,4:7]
-    
-    x = torch.cat([flow1, flow2], dim = -1) # side to side
-    x = x.clamp(-1, 1)
-
-    if dist.is_initialized() and gather:
-        gathered = [None for _ in range(dist.get_world_size())]
-        dist.all_gather(gathered, x)
-        x = torch.cat(gathered, dim=0)
-
-    x = (x.detach().float().cpu() + 1) * 127.5 # [-1,1] -> [0,255]
-    x = x.permute(0,2,3,1).numpy().astype(np.uint8) # [b,c,h,w] -> [b,h,w,c]
-    return [wandb.Image(img) for img in x]
 
 # ==== AUDIO ====
 
@@ -162,3 +135,46 @@ def log_audio_to_wandb(
         )
 
     return audio_logs
+
+def to_wandb_video(x):
+    # x is [b,n,c,h,w] [-1,1]
+    x = x.clamp(-1,1) * 127.5 + 127.5
+    x = x.to(torch.uint8).cpu()
+    x = x.numpy()
+    return [wandb.Video(x_i, fps=10, format="gif") for x_i in x]
+
+def to_wandb_video_sidebyside(original, reconstructed):
+    """
+    Create side-by-side video comparisons of original and reconstructed videos.
+    
+    Args:
+        original: Original video tensor [b,n,c,h,w] [-1,1]  
+        reconstructed: Reconstructed video tensor [b,n,c,h,w] [-1,1]
+    
+    Returns:
+        List of wandb.Video objects showing side-by-side comparisons
+    """
+
+    def to_vid(t):
+        t = t.clamp(-1,1) * 127.5 + 127.5
+        t = t.to(torch.uint8).cpu()
+        t = t.numpy()
+        return t
+
+    # Concatenate horizontally (side by side)
+    combined = torch.cat([original, reconstructed], dim=-1)  # [b,n,c,h,2*w]
+    
+    # Convert to uint8 range [0,255]
+    combined = combined.clamp(-1,1) * 127.5 + 127.5
+    combined = combined.to(torch.uint8).cpu()
+    combined = combined.numpy()
+
+    rgb = to_vid(original)
+    rec = to_vid(reconstructed)
+
+    wandb_dict = {
+        'original' : [wandb.Video(rgb_i, fps=10, format="mp4") for rgb_i in rgb],
+        'reconstructed' : [wandb.Video(rec_i, fps=10, format="mp4") for rec_i in rec],
+    }
+    
+    return wandb_dict
