@@ -18,10 +18,17 @@ from ..muon import init_muon
 from ..nn.lpips import get_lpips_cls
 from ..schedulers import get_scheduler_cls
 from ..utils import Timer, freeze, unfreeze, versatile_load
-from ..utils.logging import LogHelper, to_wandb, to_wandb_depth, to_wandb_flow
+from ..utils.logging import LogHelper, to_wandb, to_wandb_grayscale
 from .base import BaseTrainer
 from ..configs import Config
 from ..losses.dwt import dwt_loss_fn
+from ..losses.gan import (
+    merged_d_losses,
+    d_loss,
+    g_loss,
+    rec_d_loss,
+    rec_g_loss,
+)
 
 class DistillDecTrainer(BaseTrainer):
     """
@@ -50,20 +57,36 @@ class DistillDecTrainer(BaseTrainer):
         self.encoder = teacher.encoder
         self.teacher_decoder = teacher.decoder
 
+        if hasattr(self.train_cfg, 'encoder_cfg') and hasattr(self.train_cfg, 'encoder_ckpt'):
+            encoder_cfg = Config.from_yaml(self.train_cfg.encoder_cfg).model
+            encoder_ckpt = versatile_load(self.train_cfg.encoder_ckpt)
+            encoder = get_model_cls(encoder_cfg.model_id)(encoder_cfg)
+            try:
+                encoder.load_state_dict(encoder_ckpt)
+            except:
+                encoder.encoder.load_state_dict(encoder_ckpt)
+            encoder.encoder.skip_logvar = False
+            encoder.encoder.conv_out_logvar = self.encoder.conv_out_logvar
+            self.encoder = encoder.encoder
+
         model_id = self.model_cfg.model_id
         model = get_model_cls(model_id)(self.model_cfg)
         del model.encoder
         self.model = model.decoder
 
-        # Only create discriminator if GAN or feature matching is used
+        # Only create discriminator if GAN is used
         gan_weight = self.train_cfg.loss_weights.get('gan', 0.1)
-        feature_matching_weight = self.train_cfg.loss_weights.get('feature_matching', 5.0)
-        
-        if gan_weight > 0.0 or feature_matching_weight > 0.0:
+
+        if gan_weight > 0.0:
             disc_cfg = self.model_cfg.discriminator
             self.discriminator = get_discriminator_cls(disc_cfg.model_id)(disc_cfg)
+            self.use_rec_disc = (self.model_cfg.discriminator.model_id == 'recgan')
         else:
             self.discriminator = None
+
+        # Checking for DCAE "stage 3"
+        self.model_input_size = [int(self.model_cfg.sample_size[0]), int(self.model_cfg.sample_size[1])]
+        
 
         if self.rank == 0:
             model_params = sum(p.numel() for p in self.model.parameters())
@@ -101,7 +124,10 @@ class DistillDecTrainer(BaseTrainer):
         save_dict = super().load(self.train_cfg.resume_ckpt)
         self.model.load_state_dict(save_dict['model'])
         if self.discriminator is not None and 'discriminator' in save_dict:
-            self.discriminator.load_state_dict(save_dict['discriminator'])
+            try:
+                self.discriminator.load_state_dict(save_dict['discriminator'])
+            except:
+                print("Failed to load discriminator, starting it from scratch.")
         self.ema.load_state_dict(save_dict['ema'])
         self.opt.load_state_dict(save_dict['opt'])
         if self.scheduler is not None and 'scheduler' in save_dict:
@@ -116,7 +142,6 @@ class DistillDecTrainer(BaseTrainer):
         lpips_weight = self.train_cfg.loss_weights.get('lpips', 0.0)
         gan_weight = self.train_cfg.loss_weights.get('gan', 0.1)
         r12_weight = self.train_cfg.loss_weights.get('r12', 0.0)
-        feature_matching_weight = self.train_cfg.loss_weights.get('feature_matching', 0.0)
         dwt_weight = self.train_cfg.loss_weights.get('dwt', 0.0)
         l1_weight = self.train_cfg.loss_weights.get('l1', 0.0)
         l2_weight = self.train_cfg.loss_weights.get('l2', 0.0)
@@ -140,7 +165,7 @@ class DistillDecTrainer(BaseTrainer):
 
         self.encoder = self.encoder.to(self.device).bfloat16()
         freeze(self.encoder)
-        self.encoder = torch.compile(self.encoder, mode='max-autotune',dynamic=False,fullgraph=True)
+        self.encoder = torch.compile(self.encoder)#, mode='max-autotune',dynamic=False,fullgraph=True)
         self.teacher_decoder = self.teacher_decoder.to(self.device).bfloat16().eval()
         freeze(self.teacher_decoder)
 
@@ -191,64 +216,13 @@ class DistillDecTrainer(BaseTrainer):
                 return ramp
 
         def warmup_gan_weight(): return warmup_weight() * gan_weight
-        def warmup_fm_weight(): return warmup_weight() * feature_matching_weight
-
-        def fm_reduce(x, y):
-            return abs(x - y).mean()
-
-        def merged_d_losses(d, x_fake, x_real, sigma=0.01):
-            fake_scores, _ = d(x_fake.detach())
-            real_scores, _ = d(x_real.detach())
-
-            fake_scores_noisy, _ = d((x_fake + sigma*torch.randn_like(x_fake)).detach())
-            real_scores_noisy, _ = d((x_real + sigma*torch.randn_like(x_real)).detach())
-
-            r1_penalty = 0.
-            r2_penalty = 0.
-            disc_loss = 0.
-
-            for fake_out, real_out, fake_noisy, real_noisy in zip(
-                fake_scores, real_scores, fake_scores_noisy, real_scores_noisy
-            ):
-                r1_penalty += (fake_noisy - fake_out).pow(2).mean()
-                r2_penalty += (real_noisy - real_out).pow(2).mean()
-                
-                disc_loss += F.relu(1 + fake_out).mean() + F.relu(1 - real_out).mean()
-
-
-            r1_penalty = r1_penalty / len(fake_scores)
-            r2_penalty = r2_penalty / len(fake_scores) 
-            disc_loss = disc_loss / len(fake_scores)
-
-            return r1_penalty, r2_penalty, disc_loss
         
-        def d_loss(d, x_fake, x_real):
-            fake_scores, _ = d(x_fake.detach())
-            real_scores, _ = d(x_real.detach())
-
-            disc_loss = 0.
-            for fake_out, real_out in zip(fake_scores, real_scores):
-                disc_loss += F.relu(1 + fake_out).mean() + F.relu(1 - real_out).mean()
-
-            disc_loss = disc_loss / len(fake_scores)
-            return disc_loss
-
-        def g_loss(d, x_fake, x_real):
-            fake_scores, fake_features = d(x_fake)
-            _, real_features = d(x_real)
-
-            gan_loss = 0.
-            fm_loss = 0.
-
-            for fake_out in fake_scores:
-                gan_loss += -fake_out.mean()
-            gan_loss = gan_loss / len(fake_scores)
-
-            for h_fake, h_real in zip(fake_features, real_features):
-                fm_loss += sum(map(fm_reduce, h_fake, h_real)) / len(h_fake)
-            fm_loss = fm_loss / len(fake_features)
-
-            return gan_loss, fm_loss
+        def teacher_sample(batch):
+            mu, logvar = self.encoder(batch)
+            teacher_std = (logvar/2).exp()
+            teacher_z = torch.randn_like(mu) * teacher_std + mu
+            teacher_z = teacher_z / self.train_cfg.latent_scale
+            return teacher_z
 
         local_step = 0
         for _ in range(self.train_cfg.epochs):
@@ -256,37 +230,42 @@ class DistillDecTrainer(BaseTrainer):
                 total_loss = 0.
                 batch = batch.to(self.device).bfloat16()
 
+                unequal_size = (self.model_input_size != batch.shape[-2:])
+                if unequal_size:
+                    full_batch = batch.clone()
+                    batch = F.interpolate(batch, self.model_input_size, mode='bilinear', align_corners=False)
+
                 with ctx:
                     with torch.no_grad():
-                        teacher_mu, teacher_logvar = self.encoder(batch)
-                        teacher_std = (teacher_logvar/2).exp()
-                        teacher_z = torch.randn_like(teacher_mu) * teacher_std + teacher_mu
-                        teacher_z = teacher_z / self.train_cfg.latent_scale
+                        teacher_z = teacher_sample(batch)
                         batch = batch[:,:3]
 
                     batch_rec = self.model(teacher_z)
 
                     # Discriminator training - RGB only
-                    if self.discriminator is not None:
+                    if self.discriminator is not None and self.total_step_counter >= self.train_cfg.delay_adv:
                         unfreeze(self.discriminator)
-                        if r12_weight == 0.0:
+                        if self.use_rec_disc:
+                            disc_loss = rec_d_loss(self.discriminator, batch_rec[:,:3].detach(), batch[:,:3].detach()) / accum_steps
+                            metrics.log('disc_loss', disc_loss)
+                        elif r12_weight == 0.0:
                             disc_loss = d_loss(self.discriminator, batch_rec[:,:3].detach(), batch[:,:3].detach()) / accum_steps
                             metrics.log('disc_loss', disc_loss)
                         else:
-                            r1_penalty, r2_penalty, d_loss = merged_d_losses(
+                            r1_penalty, r2_penalty, disc_loss = merged_d_losses(
                                 self.discriminator, 
                                 batch_rec[:,:3].detach(), 
                                 batch[:,:3].detach()
                             )
                             r1_penalty = r1_penalty / accum_steps
                             r2_penalty = r2_penalty / accum_steps
-                            d_loss = d_loss / accum_steps
+                            disc_loss = disc_loss / accum_steps
 
                             metrics.log('r1_penalty', r1_penalty)
                             metrics.log('r2_penalty', r2_penalty)
-                            metrics.log('disc_loss', d_loss)
+                            metrics.log('disc_loss', disc_loss)
 
-                            disc_loss = d_loss + (r1_penalty + r2_penalty) * 0.5 * r12_weight
+                            disc_loss = disc_loss + (r1_penalty + r2_penalty) * 0.5 * r12_weight
 
                         self.scaler.scale(disc_loss).backward()
                         freeze(self.discriminator)
@@ -310,15 +289,15 @@ class DistillDecTrainer(BaseTrainer):
                     
                     if self.discriminator is not None:
                         crnt_gan_weight = warmup_gan_weight()
-                        crnt_fm_weight = warmup_fm_weight()
                         if crnt_gan_weight > 0.0:
                             with ctx:
-                                gan_loss, fm_loss = g_loss(self.discriminator, batch_rec[:,:3], batch[:,:3])
+                                if self.use_rec_disc:
+                                    gan_loss = rec_g_loss(self.discriminator, batch_rec[:,:3], batch[:,:3])
+                                else:
+                                    gan_loss = g_loss(self.discriminator, batch_rec[:,:3])
                                 gan_loss = gan_loss / accum_steps
-                                fm_loss = fm_loss / accum_steps
                             metrics.log('gan_loss', gan_loss)
-                            metrics.log('fm_loss', fm_loss)
-                            total_loss += crnt_gan_weight * gan_loss + crnt_fm_weight * fm_loss
+                            total_loss += crnt_gan_weight * gan_loss
 
                     self.scaler.scale(total_loss).backward()
 
@@ -328,14 +307,14 @@ class DistillDecTrainer(BaseTrainer):
                     self.scaler.unscale_(self.opt)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
 
-                    if self.discriminator is not None:
+                    if self.discriminator is not None and self.total_step_counter >= self.train_cfg.delay_adv:
                         self.scaler.unscale_(self.d_opt)
                         torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
 
                     self.scaler.step(self.opt)
                     self.opt.zero_grad(set_to_none=True)
 
-                    if self.discriminator is not None:
+                    if self.discriminator is not None and self.total_step_counter >= self.train_cfg.delay_adv:
                         self.scaler.step(self.d_opt)
                         self.d_opt.zero_grad(set_to_none=True)
                     
@@ -354,6 +333,8 @@ class DistillDecTrainer(BaseTrainer):
 
                         if self.total_step_counter % self.train_cfg.sample_interval == 0:
                             with ctx:
+                                if unequal_size:
+                                    teacher_z = teacher_sample(full_batch)
                                 ema_rec = self.ema.ema_model(teacher_z)
                                 teacher_rec = self.teacher_decoder(teacher_z)[:,:3]
 
@@ -365,23 +346,13 @@ class DistillDecTrainer(BaseTrainer):
 
                             # Log depth maps if present (4 or 7 channels)
                             if batch.shape[1] >= 4:
-                                depth_samples = to_wandb_depth(
-                                    teacher_rec.detach().contiguous().bfloat16(),
-                                    ema_rec.detach().contiguous().bfloat16(),
+                                depth_samples = to_wandb_grayscale(
+                                    teacher_rec[:,3:4].detach().contiguous().bfloat16(),
+                                    ema_rec[:,3:4].detach().contiguous().bfloat16(),
                                     gather = False
                                 )
                                 if depth_samples:
                                     wandb_dict['depth_samples'] = depth_samples
-                            
-                            # Log optical flow if present (7 channels)
-                            if batch.shape[1] >= 7:
-                                flow_samples = to_wandb_flow(
-                                    teacher_rec.detach().contiguous().bfloat16(),
-                                    ema_rec.detach().contiguous().bfloat16(),
-                                    gather = False
-                                )
-                                if flow_samples:
-                                    wandb_dict['flow_samples'] = flow_samples
 
                         if self.rank == 0:
                             wandb.log(wandb_dict)
