@@ -46,3 +46,23 @@ class Gate(nn.Module):
         c = c[:,None,:].expand(b,n,-1) # [b,n,d]
 
         return c * x
+
+class FiLM(nn.Module):
+    def __init__(self, dim_in, dim_out):
+        super().__init__()
+
+        self.alpha_beta = nn.Linear(dim_in, 2 * dim_out)
+
+    def forward(self, x, cond):
+        # x is [b,c,n,h,w]
+        # cond is [b,n,d]
+
+        y = F.silu(cond)
+        ab = self.alpha_beta(y).permute(0,2,1) # [b,2d,n]
+        a,b = ab.chunk(2,dim=1) # each [b,d,n]
+
+        a = a[:,:,:,None,None]
+        b = b[:,:,:,None,None]
+
+        x = x * (1. + a) + b
+        return x
