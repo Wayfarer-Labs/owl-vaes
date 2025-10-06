@@ -6,23 +6,28 @@ class CausDecSampler:
     Sampler for Causal DCAE decoder
     """
     @torch.no_grad()
-    def __call__(self, decoder, latents, window_size : int):
-        # Decoder is latents -> videos 
-        # [b,n,c,h,w]
+    def __call__(self, decoder, latents, window_size: int):
+        # latents: [B, N, C, H, W]
+        B, N, C, H, W = latents.shape
+        assert N >= window_size, f"{N=} < {window_size=}"
 
-        assert latents.shape[1] >= window_size
+        # Optional but helps if any layers are mode-sensitive
+        was_training = decoder.training
+        decoder.eval()
 
-        recs = []
-        
-        # First window, generate all frames
-        rec = decoder(latents[:,:window_size], ignore_nonterminal_frames = False)
-        recs.append(rec)
+        # First window: full decode
+        rec0 = decoder(latents[:, :window_size], ignore_nonterminal_frames=False)  # [B, W, C, H, W]
+        out = latents.new_empty((B, N, rec0.shape[2], rec0.shape[3], rec0.shape[4]))
+        out[:, :window_size] = rec0
 
-        for i in tqdm(range(1, latents.shape[1] - window_size + 1), desc = "Generating video..."):
-            rec = decoder(latents[:,i:i+window_size], ignore_nonterminal_frames = True)
-            recs.append(rec)
+        # Subsequent windows: terminal-only
+        for i in range(1, N - window_size + 1):
+            rec = decoder(latents[:, i:i+window_size], ignore_nonterminal_frames=True)  # [B, 1, C, H, W]
+            out[:, window_size + i - 1] = rec[:, -1]  # or rec[:, 0]
 
-        return torch.cat(recs, dim=1)
+        if was_training:
+            decoder.train()
+        return out
 
 
 if __name__ == "__main__":
