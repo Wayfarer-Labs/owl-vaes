@@ -1,13 +1,11 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torch.nn.utils.parametrizations import weight_norm
+from copy import deepcopy
 
+from .patchgan import PatchGAN
 
-def make_conv(ch_in, ch_out, k=4, s=2, p=1, bias=True):
-    return weight_norm(nn.Conv3d(ch_in, ch_out, k, s, p, bias=bias))
-
-class PatchGAN3D(nn.Module):
+class PatchGAN3D(PatchGAN):
     """
     PatchGAN discriminator that outputs a grid of predictions.
     Each output value corresponds to a patch of the input image.
@@ -17,51 +15,17 @@ class PatchGAN3D(nn.Module):
     """
 
     def __init__(self, config):
-        super().__init__()
-
-        ch = getattr(config, 'ch_0', 64)
-        channels = config.channels
-        n_layers = getattr(config, 'n_layers', 3)
-
-        self.n_layers = n_layers
-
-        layers = []
-
-        # First layer: no normalization
-        layers.append(nn.Conv3d(channels, ch, kernel_size=(3,4,4), stride=(1,2,2), padding=(1,1,1), bias=False))
-        layers.append(nn.LeakyReLU(0.2))
-
-        # Intermediate layers
-        ch_mult = 1
-        for i in range(1, n_layers):
-            ch_mult_prev = ch_mult
-            ch_mult = min(2 ** i, 8)  # Cap at 8x to prevent explosion
-            layers.append(make_conv(ch * ch_mult_prev, ch * ch_mult, k=(3,4,4), s=(1,2,2), p=(1,1,1), bias=False))
-            layers.append(nn.LeakyReLU(0.2))
-
-        # Final layer before output
-        ch_mult_prev = ch_mult
-        ch_mult = min(2 ** n_layers, 8)
-        layers.append(make_conv(ch * ch_mult_prev, ch * ch_mult, k=(3,4,4), s=(1,1,1), p=(1,1,1), bias=False))
-        layers.append(nn.LeakyReLU(0.2))
-
-        # Output layer: single channel, no normalization
-        layers.append(nn.Conv3d(ch * ch_mult, 1, kernel_size=(3,4,4), stride=(1,1,1), padding=(1,1,1), bias=False))
-
-        self.model = nn.Sequential(*layers)
+        n_frames = getattr(config, 'n_frames', 4)
+        config = deepcopy(config)
+        config.channels = config.channels * n_frames
+        super().__init__(config)
 
     def forward(self, x, output_hidden_states=False):
         """
-        Forward pass through PatchGAN discriminator.
-
-        Args:
-            x: Input tensor of shape (B, T, C, H, W)
-
-        Returns:
-            If output_hidden_states=False: Tensor of shape (B, 1, T, H_out, W_out)
-                where H_out and W_out depend on input size and number of layers
+        Assume x is [b,n,c,h,w]
         """
-        x = x.permute(0, 2, 1, 3, 4)
+        b,n,c,h,w = x.shape
+        x = x.contiguous().view(b,n*c,h,w).contiguous()
         return self.model(x)
 
 if __name__ == "__main__":
