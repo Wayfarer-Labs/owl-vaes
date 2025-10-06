@@ -2,6 +2,7 @@ import einops as eo
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.attention.flex_attention import flex_attention
 
 from owl_vaes.configs import TransformerConfig
 
@@ -10,7 +11,9 @@ from .mlp import MLP
 from .normalization import LayerNorm, QKNorm
 from .rope import get_rope_impl
 
+
 torch.backends.cuda.enable_flash_sdp(enabled=True)
+flex_attention = torch.compile(flex_attention)
 
 from einops._torch_specific import allow_ops_in_compiled_graph
 allow_ops_in_compiled_graph()
@@ -37,7 +40,7 @@ class Attn(nn.Module):
         if rope_impl is None:
             self.rope = None
         else:
-            self.rope = get_rope_impl(rope_impl)(config)
+            self.rope = get_rope_impl(rope_impl)(config.d_model, config.n_heads)
         self.causal = config.causal
 
         self.layer_ind = None
@@ -223,6 +226,40 @@ class PatchProjOut(nn.Module):
         x = self.act(x)
         x = self.proj(x)
         x = eo.rearrange(x, 'b (h w) (ph pw c) -> b c (h ph) (w pw)', h = self.n_patches, ph = self.patch_size, pw = self.patch_size)
+
+        return x
+
+class TemporalAttn(nn.Module):
+    def __init__(self, d_model, n_heads, n_frames, layer_ind = None):
+        super().__init__()
+
+        self.n_frames = n_frames
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.qk_norm = QKNorm(d_model // n_heads)
+        self.rope = get_rope_impl("simple")(d_model, n_heads)
+        self.layer_ind = layer_ind
+
+    def forward(self, x, kv_cache = None):
+        # x is [b*n, c, h, w]
+        bn,c,h,w = x.shape
+        b = bn//self.n_frames
+
+        x = x.view(b, self.n_frames, c, h, w)
+        x = x.permute(0,3,4,1,2).view(b*h*w,self.n_frames,c)
+        # bhw,n,c
+
+        qkv = self.qkv(x)
+        qkv = qkv.view(b*h*w, self.n_frames, 3, n_heads, c//n_heads)
+        qkv = qkv.permute(2,0,3,1,4) # 3,bhw,n_heads,n_frames,d_model//n_heads
+        q,k,v = qkv[0], qkv[1], qkv[2]
+
+        q,k = self.qk_norm(q,k)
+        q,k = self.rope(q,k)
+
+        x = flex_attention(q,k,v,is_causal=True)
+        x = x.view(b,h,w,self.n_frames,c)
+        x = x.permute(0,3,4,1,2)
+        x = x.view(b*self.n_frames,c,h,w)
 
         return x
 

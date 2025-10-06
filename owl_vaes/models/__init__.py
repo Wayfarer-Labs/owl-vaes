@@ -31,4 +31,7 @@ def get_model_cls(model_id: str) -> Any:
     if model_id == "distill_vae":
         from .distill_vae import DistillVAE
         return DistillVAE
+    if model_id == "causal_dcae":
+        from .causal_dcae import CausalDCAE
+        return CausalDCAE
     return None

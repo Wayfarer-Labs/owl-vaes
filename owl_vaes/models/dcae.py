@@ -26,6 +26,7 @@ class Encoder(nn.Module):
         ch_0 = config.ch_0
         ch_max = config.ch_max
         self.skip_logvar = getattr(config, "skip_logvar", False)
+        self.skip_residuals = getattr(config, "skip_residuals", False)
 
         self.conv_in = WeightNormConv2d(config.channels, ch_0, 3, 1, 1)
 
@@ -40,7 +41,7 @@ class Encoder(nn.Module):
             next_ch = min(ch*2, ch_max)
 
             blocks.append(DownBlock(ch, next_ch, block_count, total_blocks))
-            residuals.append(SpaceToChannel(ch, next_ch))
+            residuals.append(SpaceToChannel(ch, next_ch)) if not self.skip_residuals else None
 
             ch = next_ch
 
@@ -48,11 +49,11 @@ class Encoder(nn.Module):
         self.middle_block = SameBlock(ch_max, ch_max, blocks_per_stage[-1], total_blocks) if self.use_middle_block else None
 
         self.blocks = nn.ModuleList(blocks)
-        self.residuals = nn.ModuleList(residuals)
+        self.residuals = nn.ModuleList(residuals) if not self.skip_residuals else None
 
         self.avg_factor = ch // config.latent_channels
         
-        self.conv_out = ChannelAverage(ch, config.latent_channels)
+        self.conv_out = ChannelAverage(ch, config.latent_channels) if not self.skip_residuals else WeightNormConv2d(ch, config.latent_channels, 3, 1, 1)
         #self.conv_out = weight_norm(nn.Conv2d(ch, config.latent_channels, 3, 1, 1))
         
         self.conv_out_logvar = WeightNormConv2d(ch, config.latent_channels, 3, 1, 1) if not self.skip_logvar else None
@@ -64,9 +65,13 @@ class Encoder(nn.Module):
 
     def forward(self, x):
         x = self.conv_in(x)
-        for (block, shortcut) in zip(self.blocks, self.residuals):
-            res = shortcut(x)
-            x = block(x) + res
+        if not self.skip_residuals:
+            for (block, shortcut) in zip(self.blocks, self.residuals):
+                res = shortcut(x)
+                x = block(x) + res
+        else:
+            for block in self.blocks:
+                x = block(x)
 
         if self.use_middle_block:
             x = self.middle_block(x) + x
@@ -87,6 +92,7 @@ class Decoder(nn.Module):
         super().__init__()
 
         self.config = config
+        self.skip_residuals = getattr(config, "skip_residuals", False)
 
         size = config.sample_size
         latent_size = config.latent_size
@@ -94,7 +100,7 @@ class Decoder(nn.Module):
         ch_max = config.ch_max
 
         self.rep_factor = ch_max // config.latent_channels
-        self.conv_in = ChannelDuplication(config.latent_channels, ch_max)
+        self.conv_in = ChannelDuplication(config.latent_channels, ch_max) if not self.skip_residuals else WeightNormConv2d(config.latent_channels, ch_max, 3, 1, 1)
         #self.conv_in = weight_norm(nn.Conv2d(config.latent_channels, ch_max, 3, 1, 1))
 
         blocks = []
@@ -111,12 +117,12 @@ class Decoder(nn.Module):
             next_ch = min(ch*2, ch_max)
 
             blocks.append(UpBlock(next_ch, ch, block_count, total_blocks))
-            residuals.append(ChannelToSpace(next_ch, ch))
+            residuals.append(ChannelToSpace(next_ch, ch)) if not self.skip_residuals else None
 
             ch = next_ch
 
         self.blocks = nn.ModuleList(list(reversed(blocks)))
-        self.residuals = nn.ModuleList(list(reversed(residuals)))
+        self.residuals = nn.ModuleList(list(reversed(residuals))) if not self.skip_residuals else None
 
         self.conv_out = WeightNormConv2d(ch_0, config.channels, 3, 1, 1)
         self.act_out = nn.SiLU()
@@ -129,8 +135,12 @@ class Decoder(nn.Module):
         if self.use_middle_block:
             x = self.middle_block(x) + x
 
-        for (block, shortcut) in zip(self.blocks, self.residuals):
-            x = block(x) + shortcut(x)
+        if not self.skip_residuals:
+            for (block, shortcut) in zip(self.blocks, self.residuals):
+                x = block(x) + shortcut(x)
+        else:
+            for block in self.blocks:
+                x = block(x)
 
         x = self.act_out(x)
         x = self.conv_out(x)

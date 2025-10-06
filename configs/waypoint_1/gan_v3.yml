@@ -1,0 +1,78 @@
+model:
+  model_id: causal_dcae
+  sample_size: [512,512]
+  channels: 3
+  latent_size: [8, 8]
+  latent_channels: 64
+
+  ch_0: 192
+  ch_max: 1536
+
+  encoder_blocks_per_stage: [1, 1, 1, 1, 1]
+  decoder_blocks_per_stage: [1, 1, 1, 1, 1]
+
+  use_middle_block: false
+  skip_logvar: true
+
+  discriminator:
+    model_id: patchgan3d
+    channels: 3
+    ch_0: 128
+    sample_size: [512, 512]
+
+train:
+  trainer_id: caus_distill_dec
+  data_id: procedural_rgb
+  data_kwargs:
+    root_dir: /mnt/data/waypoint_1/data/MKIF_360P #, /mnt/data/waypoint_1/data_pt/egoexplore]
+    output_dir: /mnt/data/waypoint_1/data_pt/MKIF_360P
+    mix_ratios: null
+    window_size: 4
+    target_size: [512,512]
+
+  target_batch_size: 64
+  batch_size: 8
+
+  epochs: 200
+
+  opt: AdamW
+  opt_kwargs:
+    lr: 5.0e-5
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.95]
+    eps: 1.0e-15
+
+  lpips_type: convnext
+  loss_weights:
+    l2: 1.0
+    lpips: 10.0
+    gan: 0.25
+    r12: 0.0
+
+  scheduler: LinearWarmup
+  scheduler_kwargs:
+    warmup_steps: 1500
+    min_lr: 5.0e-6
+
+  delay_adv: 60000
+  warmup_adv: 2000
+
+  checkpoint_dir: checkpoints/waypoint_1_gan_dec_distill_r3gan
+  teacher_ckpt: checkpoints/waypoint_1_f32c64_8res_rgb_only/step_385000.pt
+  teacher_cfg: configs/waypoint_1/rgb_only.yml
+
+  #encoder_cfg: configs/waypoint_1/rgb_enc_distill.yml
+  #encoder_ckpt: wp1_vae_enc_distill.pt
+
+  resume_ckpt: checkpoints/waypoint_1_gan_dec_distill_r3gan/step_60000.pt
+
+  sample_interval: 1000
+  save_interval: 5000
+
+  latent_shift: 0
+  latent_scale: 1
+
+wandb:
+  name: ${env:WANDB_USER_NAME}
+  project: new_vaes
+  run_name: waypoint_1_gan_dec (causdec)

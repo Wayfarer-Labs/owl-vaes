@@ -42,5 +42,8 @@ def get_trainer_cls(trainer_id: Literal["rec", "proxy", "audio_rec"]):
         case "caus_diffdec":
             from .caus_diffdec_trainer import CausalDiffusionDecoderTrainer
             return CausalDiffusionDecoderTrainer
+        case "caus_distill_dec":
+            from .caus_distill_dec import CausalDistillDecoderTrainer
+            return CausalDistillDecoderTrainer
         case _:
             raise NotImplementedError

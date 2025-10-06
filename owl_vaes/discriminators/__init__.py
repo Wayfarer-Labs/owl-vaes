@@ -12,3 +12,12 @@ def get_discriminator_cls(model_id):
     if model_id == "patch":
         from .patch import PatchDiscriminator
         return PatchDiscriminator
+    if model_id == "patchgan":
+        from .patchgan import PatchGAN
+        return PatchGAN
+    if model_id == "recgan":
+        from .rgan import ReconstructionGAN
+        return ReconstructionGAN
+    if model_id == "patchgan3d":
+        from .patchgan3d import PatchGAN3D
+        return PatchGAN3D

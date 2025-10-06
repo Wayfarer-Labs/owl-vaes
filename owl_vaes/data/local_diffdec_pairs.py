@@ -23,69 +23,108 @@ import glob
 import torch
 import random
 from torch.utils.data import IterableDataset, DataLoader
+import torch.nn.functional as F
 
 class LocalLatentDataset(IterableDataset):
     def __init__(
         self,
         root_dir,
         window_size=1,
+        target_size=None,
+        mix_ratios=None,
     ):
         super().__init__()
-        self.root_dir = root_dir
+        # Allow root_dir to be a list of strings or a single string
+        if isinstance(root_dir, str):
+            self.root_dirs = [root_dir]
+        else:
+            self.root_dirs = list(root_dir)
         self.window_size = window_size
+        self.target_size = target_size
 
-        # Use depth files as anchor
-        pattern = os.path.join(root_dir, "**", "*_depth.pt")
-        self.anchor_files = glob.glob(pattern, recursive=True)
-        if not self.anchor_files:
-            raise ValueError(f"No depth files found in {root_dir}")
+        # Handle mix_ratios
+        self.mix_ratios = mix_ratios
+        if self.mix_ratios is not None:
+            self.mix_ratios = [float(x) for x in self.mix_ratios]
+            if not isinstance(self.mix_ratios, (list, tuple)):
+                raise ValueError("mix_ratios must be a list or tuple of floats")
+            if len(self.mix_ratios) != len(self.root_dirs):
+                raise ValueError("mix_ratios must be the same length as root_dirs")
+            if not abs(sum(self.mix_ratios) - 1.0) < 1e-6:
+                raise ValueError("mix_ratios must sum to 1.0")
 
-        # Build list of (rgb, depth) file pairs
-        self.pair_files = []
-        for depth_path in self.anchor_files:
-            rgb_path = depth_path.replace("_depth.pt", "_rgb.pt")
-            self.pair_files.append((rgb_path, depth_path))
+        # For each root_dir, collect rgb files
+        self.rgb_files_per_dir = []
+        self.all_rgb_files = []
+        for root in self.root_dirs:
+            pattern = os.path.join(root, "**", "*_rgb.pt")
+            rgb_files = glob.glob(pattern, recursive=True)
+            if not rgb_files:
+                print(f"Warning: No rgb files found in {root}")
+                self.rgb_files_per_dir.append([])
+                continue
+            self.rgb_files_per_dir.append(rgb_files)
+            self.all_rgb_files.extend(rgb_files)
 
-        print(f"Found {len(self.pair_files)} pairs of RGB and depth files")
+        if self.mix_ratios is not None:
+            total_valid = sum(len(rf) for rf in self.rgb_files_per_dir)
+            if total_valid == 0:
+                raise ValueError(f"No rgb files found in any root_dir")
+            for i, rf in enumerate(self.rgb_files_per_dir):
+                print(f"Found {len(rf)} rgb files in {self.root_dirs[i]}")
+        else:
+            if not self.all_rgb_files:
+                raise ValueError(f"No rgb files found in {self.root_dirs}")
+            print(f"Found {len(self.all_rgb_files)} rgb files in {self.root_dirs}")
 
     def __iter__(self):
         while True:
             try:
-                rgb_path, depth_path = random.choice(self.pair_files)
+                # Select rgb_path according to mix_ratios if provided
+                if self.mix_ratios is not None:
+                    dir_idx = random.choices(range(len(self.rgb_files_per_dir)), weights=self.mix_ratios, k=1)[0]
+                    rgb_files = self.rgb_files_per_dir[dir_idx]
+                    if not rgb_files:
+                        continue  # skip empty dataset
+                    rgb_path = random.choice(rgb_files)
+                else:
+                    rgb_path = random.choice(self.all_rgb_files)
 
-                rgb_tensor = torch.load(rgb_path, map_location='cpu', mmap=True)
-                depth_tensor = torch.load(depth_path, map_location='cpu', mmap=True)
+                rgb_tensor = torch.load(rgb_path, map_location='cpu', mmap=True, weights_only=False)
                 n = rgb_tensor.shape[0]
                 w = self.window_size
 
                 if w == 1:
                     idx = random.randint(0, n - 1)
                     rgb_sample = rgb_tensor[idx]
-                    depth_sample = depth_tensor[idx]
                 else:
                     if n < w:
                         raise ValueError(f"Not enough frames in {rgb_path} to sample a window of size {w}")
                     start_idx = random.randint(0, n - w)
                     rgb_sample = rgb_tensor[start_idx:start_idx + w]
-                    depth_sample = depth_tensor[start_idx:start_idx + w]
 
-                yield (rgb_sample, depth_sample)
+                yield rgb_sample
             except Exception as e:
-                print(f"Error loading {rgb_path} or {depth_path}: {e}")
+                print(f"Error loading {rgb_path}: {e}")
                 continue
 
-def collate_fn_rgb_depth(batch):
-    # batch is a list of (rgb, depth) tuples
-    rgbs, depths = zip(*batch)
-    batch_rgb = torch.stack(rgbs).to(torch.bfloat16)
-    batch_rgb = (batch_rgb / 127.5) - 1.0  # [0,255] -> [-1,1]
-    batch_depth = torch.stack(depths).to(torch.bfloat16)
-    batch_depth = (batch_depth / 127.5) - 1.0  # [0,255] -> [-1,1]
-    return batch_rgb, batch_depth
+def collate_fn_rgb(batch):
+    # batch is a list of rgb tensors, each of shape [c,h,w] or [w,c,h,w]
+    # If window_size==1: [b, c, h, w]
+    # If window_size>1: [b, w, c, h, w]
+    if isinstance(batch[0], torch.Tensor) and batch[0].ndim == 3:
+        # [b, c, h, w]
+        batch_rgb = torch.stack(batch).to(torch.bfloat16)
+        batch_rgb = (batch_rgb / 127.5) - 1.0  # [0,255] -> [-1,1]
+    else:
+        # [b, w, c, h, w]
+        batch_rgb = torch.stack(batch).to(torch.bfloat16)
+        batch_rgb = (batch_rgb / 127.5) - 1.0  # [0,255] -> [-1,1]
+    return batch_rgb
 
 def get_loader(batch_size, **data_kwargs):
     ds = LocalLatentDataset(**data_kwargs)
-    return DataLoader(ds, batch_size=batch_size, num_workers = 8, prefetch_factor = 2, pin_memory=True, collate_fn=collate_fn_rgb_depth)
+    return DataLoader(ds, batch_size=batch_size, num_workers=8, prefetch_factor=2, pin_memory=True, collate_fn=collate_fn_rgb)
 
 def draw_tensor(tensor, filename="sample.png"):
     """
@@ -124,11 +163,14 @@ def draw_tensor(tensor, filename="sample.png"):
     print(f"Saved {filename}")
 
 if __name__ == "__main__":
-    root_dir = "/mnt/data/datasets/cod_yt_latents"
+    root_dir = "/mnt/data/waypoint_1/data_pt/MKIF_360P"
     batch_size = 32
 
     loader = get_loader(batch_size, root_dir=root_dir, window_size=4)
-    batch_rgb, batch_depth = next(iter(loader))
+    batch_rgb = next(iter(loader))
+
+    draw_tensor(batch_rgb[0])
+    exit()
 
     import time
 
@@ -142,7 +184,7 @@ if __name__ == "__main__":
 
     for i in range(n_batches - 2):
         start = time.time()
-        batch_rgb, batch_depth = next(loader_iter)
+        batch_rgb = next(loader_iter)
         end = time.time()
         times.append(end - start)
         print(f"Batch {i+1} loaded in {times[-1]:.4f} seconds")
