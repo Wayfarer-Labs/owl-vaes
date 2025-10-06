@@ -47,33 +47,37 @@ class CausalDecoder(Decoder):
         ])
     
     def pack(self, x):
-        # b c t h w -> (b*t) c h w
-        b,c,t,h,w = x.shape
-        x = x.permute(0, 2, 1, 3, 4)
-        return x.contiguous().view(b*t, c, h, w)
+        b,n,c,h,w = x.shape
+        return x.reshape(b*n, c, h, w)
     
     def unpack(self, x, b):
-        # (b*t) c h w -> b c t h w
-        bt,c,h,w = x.shape
-        t = bt // b
-        return x.contiguous().view(b, c, t, h, w)
+        # (b*n) c h w -> b n c h w
+        bn,c,h,w = x.shape
+        return x.reshape(b, bn//b, c, h, w)
 
     def forward(self, x, ignore_nonterminal_frames = False):
         b = x.shape[0]
 
         # x is [b,n,c,h,w]
-        x = x.permute(0, 2, 1, 3, 4) # -> [b,c,n,h,w]
-
-        x_pad = F.pad(x,(0, 0, 0, 0, 2, 0))
-        f = self.conv_to_f(x_pad)# -> [b,c,t, 1, 1]
+        # Prepare for f vector (3d conv)
+        x_f = x.permute(0, 2, 1, 3, 4) # -> [b,c,n,h,w]
+        x_f = F.pad(x_f,(0, 0, 0, 0, 2, 0))
+        f = self.conv_to_f(x_f)# -> [b,c,t, 1, 1]
         f = f.mean((-1,-2)) # -> [b,t,c]
         f = f.permute(0, 2, 1) # -> [b,t,c]
-        f = self.crt(f) # -> [b,t,c]
+        f = self.crt(f) # -> [b,n,d]
+
+        # L2 normalize f
+        f = F.normalize(f, p=2, dim=-1)
 
         if ignore_nonterminal_frames:
             f = f[:,-1:]
-            x = x[:,:,-1:] 
+            x = x[:,-1:] 
 
+        # Pack seq into batch
+        # All frames now processed independently
+        # Only temporal signal is their f vector
+        # f vector is *like* style vector to control content
         x = self.pack(x)
         x = self.conv_in(x)
 
@@ -82,19 +86,17 @@ class CausalDecoder(Decoder):
 
         if not self.skip_residuals:
             for (block, shortcut, film) in zip(self.blocks, self.residuals, self.film_modules):
-                x = self.pack(film(self.unpack(x, b), f))
+                x = x = film(x, f)
                 x = block(x) + shortcut(x)
         else:
             for (block, film) in zip(self.blocks, self.film_modules):
-                x = self.pack(film(self.unpack(x, b), f))
+                x = film(x, f)
                 x = block(x)
 
         x = self.act_out(x)
         x = self.conv_out(x)
 
-        x = self.unpack(x, b)
-        x = x.permute(0, 2, 1, 3, 4) # -> [b,t,c,h,w]
-
+        x = self.unpack(x, b) # -> [b,n,c,h,w]
         return x
 
 class CausalDCAE(nn.Module):
@@ -127,6 +129,8 @@ if __name__ == "__main__":
     decoder = model.decoder
 
     with torch.no_grad():
-        x = torch.randn(1, 4, 64, 16, 16).cuda().bfloat16()
-        rec = decoder(x, ignore_nonterminal_frames = True)
-        print(rec.shape)
+        x = torch.randn(8, 4, 64, 16, 16).cuda().bfloat16()
+        rec_1 = decoder(x, ignore_nonterminal_frames = True)
+        rec_2 = decoder(x, ignore_nonterminal_frames = False)[:,-1:]
+
+        print((rec_1 - rec_2).abs().max())

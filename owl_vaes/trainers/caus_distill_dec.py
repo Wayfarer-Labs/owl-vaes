@@ -76,9 +76,11 @@ class CausalDistillDecoderTrainer(BaseTrainer):
         if gan_weight > 0.0:
             disc_cfg = self.model_cfg.discriminator
             self.discriminator = get_discriminator_cls(disc_cfg.model_id)(disc_cfg)
+            self.disc_2 = get_discriminator_cls("patchgan")(disc_cfg)
             self.use_rec_disc = (self.model_cfg.discriminator.model_id == 'recgan')
         else:
             self.discriminator = None
+            self.disc_2 = None
 
         # Checking for DCAE "stage 3"
         self.model_input_size = [int(self.model_cfg.sample_size[0]), int(self.model_cfg.sample_size[1])]
@@ -94,6 +96,7 @@ class CausalDistillDecoderTrainer(BaseTrainer):
         self.ema = None
         self.opt = None
         self.d_opt = None
+        self.d_2_opt = None
         self.scheduler = None
         self.scaler = None
 
@@ -136,7 +139,7 @@ class CausalDistillDecoderTrainer(BaseTrainer):
 
         # Loss weights
         lpips_weight = self.train_cfg.loss_weights.get('lpips', 0.0)
-        gan_weight = self.train_cfg.loss_weights.get('gan', 0.1)
+        gan_weight = self.train_cfg.loss_weights.get('gan', 0.5)
         r12_weight = self.train_cfg.loss_weights.get('r12', 0.0)
         dwt_weight = self.train_cfg.loss_weights.get('dwt', 0.0)
         l1_weight = self.train_cfg.loss_weights.get('l1', 0.0)
@@ -153,6 +156,12 @@ class CausalDistillDecoderTrainer(BaseTrainer):
             if self.world_size > 1:
                 self.discriminator = DDP(self.discriminator)
             freeze(self.discriminator)
+        
+        if self.disc_2 is not None:
+            self.disc_2 = self.disc_2.to(self.device).train()
+            if self.world_size > 1:
+                self.disc_2 = DDP(self.disc_2)
+            freeze(self.disc_2)
 
         lpips = None
         if lpips_weight > 0.0:
@@ -178,6 +187,9 @@ class CausalDistillDecoderTrainer(BaseTrainer):
         self.opt = opt_cls(self.model.parameters(), **self.train_cfg.opt_kwargs)
         if self.discriminator is not None:
             self.d_opt = opt_cls(self.discriminator.parameters(), **self.train_cfg.opt_kwargs)
+
+        if self.disc_2 is not None:
+            self.d_2_opt = opt_cls(self.disc_2.parameters(), **self.train_cfg.opt_kwargs)
 
         if self.train_cfg.scheduler is not None:
             self.scheduler = get_scheduler_cls(self.train_cfg.scheduler)(self.opt, **self.train_cfg.scheduler_kwargs)
@@ -274,6 +286,13 @@ class CausalDistillDecoderTrainer(BaseTrainer):
 
                         self.scaler.scale(disc_loss).backward()
                         freeze(self.discriminator)
+                    
+                    if self.disc_2 is not None and self.total_step_counter >= self.train_cfg.delay_adv:
+                        unfreeze(self.disc_2)
+                        disc_loss = d_loss(self.disc_2, pack(batch_rec.detach()), pack(batch.detach())) / accum_steps
+                        metrics.log('disc_loss_2d', disc_loss)
+                        self.scaler.scale(disc_loss).backward()
+                        freeze(self.disc_2)
 
                     if l2_weight > 0.0:
                         l2_loss = F.mse_loss(batch_rec, batch) / accum_steps
@@ -291,6 +310,9 @@ class CausalDistillDecoderTrainer(BaseTrainer):
                         if crnt_gan_weight > 0.0:
                             with ctx:
                                 gan_loss = g_loss(self.discriminator, batch_rec)
+                                if self.disc_2 is not None:
+                                    gan_loss_2 = g_loss(self.disc_2, pack(batch_rec))
+                                    gan_loss = gan_loss + gan_loss_2
                                 gan_loss = gan_loss / accum_steps
                             metrics.log('gan_loss', gan_loss)
                             total_loss += crnt_gan_weight * gan_loss
@@ -300,12 +322,16 @@ class CausalDistillDecoderTrainer(BaseTrainer):
                 local_step += 1
                 if local_step % accum_steps == 0:
                     # Updates
-                    self.scaler.unscale_(self.opt)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    #self.scaler.unscale_(self.opt)
+                    #torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
 
-                    if self.discriminator is not None and self.total_step_counter >= self.train_cfg.delay_adv:
-                        self.scaler.unscale_(self.d_opt)
-                        torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
+                    #if self.discriminator is not None and self.total_step_counter >= self.train_cfg.delay_adv:
+                    #    self.scaler.unscale_(self.d_opt)
+                    #    torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
+
+                    #if self.disc_2 is not None and self.total_step_counter >= self.train_cfg.delay_adv:
+                        #self.scaler.unscale_(self.d_2_opt)
+                        #torch.nn.utils.clip_grad_norm_(self.disc_2.parameters(), max_norm=1.0)
 
                     self.scaler.step(self.opt)
                     self.opt.zero_grad(set_to_none=True)
@@ -313,7 +339,11 @@ class CausalDistillDecoderTrainer(BaseTrainer):
                     if self.discriminator is not None and self.total_step_counter >= self.train_cfg.delay_adv:
                         self.scaler.step(self.d_opt)
                         self.d_opt.zero_grad(set_to_none=True)
-                    
+
+                    if self.disc_2 is not None and self.total_step_counter >= self.train_cfg.delay_adv:
+                        self.scaler.step(self.d_2_opt)
+                        self.d_2_opt.zero_grad(set_to_none=True)
+
                     self.scaler.update()
 
                     if self.scheduler is not None:
