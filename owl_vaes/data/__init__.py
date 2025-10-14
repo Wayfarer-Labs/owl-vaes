@@ -37,3 +37,9 @@ def get_loader(data_id: str, batch_size: int, **data_kwargs):
     if data_id == "procedural_rgb":
         from .procedural_rgb import get_loader
         return get_loader(batch_size, **data_kwargs)
+    if data_id == "owlc_loader":
+        from .owlc_loader import get_loader
+        return get_loader(batch_size, **data_kwargs)
+    if data_id == "video_dir_loader":
+        from .video_dir_loader import get_loader
+        return get_loader(batch_size, **data_kwargs)

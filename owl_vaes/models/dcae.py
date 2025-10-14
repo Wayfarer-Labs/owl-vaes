@@ -17,6 +17,15 @@ from ..nn.resnet import WeightNormConv2d
 from torch.utils.checkpoint import checkpoint
 import torch.distributions as dist
 
+def is_landscape(config : 'ResNetConfig'):
+    sample_size = config.sample_size
+    if isinstance(sample_size, int):
+        return False, None
+    sample_size = (int(sample_size[0]), int(sample_size[1]))
+    if sample_size[0] < sample_size[1]: # width > height
+        return True, sample_size
+    return False, None
+
 class Encoder(nn.Module):
     def __init__(self, config : 'ResNetConfig'):
         super().__init__()
@@ -27,8 +36,9 @@ class Encoder(nn.Module):
         ch_max = config.ch_max
         self.skip_logvar = getattr(config, "skip_logvar", False)
         self.skip_residuals = getattr(config, "skip_residuals", False)
-
-        self.conv_in = WeightNormConv2d(config.channels, ch_0, 3, 1, 1)
+        
+        self.is_landscape, landscape_size = is_landscape(config)
+        self.conv_in = LandscapeToSquare(landscape_size, config.channels, ch_0) if self.is_landscape else WeightNormConv2d(config.channels, ch_0, 3, 1, 1)
 
         blocks = []
         residuals = []
@@ -93,6 +103,7 @@ class Decoder(nn.Module):
 
         self.config = config
         self.skip_residuals = getattr(config, "skip_residuals", False)
+        self.is_landscape, landscape_size = is_landscape(config)
 
         size = config.sample_size
         latent_size = config.latent_size
@@ -124,7 +135,7 @@ class Decoder(nn.Module):
         self.blocks = nn.ModuleList(list(reversed(blocks)))
         self.residuals = nn.ModuleList(list(reversed(residuals))) if not self.skip_residuals else None
 
-        self.conv_out = WeightNormConv2d(ch_0, config.channels, 3, 1, 1)
+        self.conv_out = SquareToLandscape(landscape_size, ch_0, config.channels) if self.is_landscape else WeightNormConv2d(ch_0, config.channels, 3, 1, 1)
         self.act_out = nn.SiLU()
 
         self.decoder_only = decoder_only
