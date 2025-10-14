@@ -207,7 +207,7 @@ class LandscapeToSquare(nn.Module):
         self.target = find_nearest_square(h,w)
 
         if ch_out is None: ch_out = ch
-        self.proj = WeightNormConv2d(ch, ch_out, 3, 1, 1, bias = False)
+        self.proj = WeightNormConv2d(ch, ch_out, 3, 1, 1)
     
     def forward(self, x):
         # x is [9, 16]
@@ -222,10 +222,11 @@ class SquareToLandscape(nn.Module):
         self.target = tuple(landscape_size)
 
         if ch_out is None: ch_out = ch
-        self.proj = WeightNormConv2d(ch, ch_out, 3, 1, 1, bias = False)
+        self.proj = WeightNormConv2d(ch, ch_out, 3, 1, 1)
 
     def forward(self, x):
         # x is [1,1]
         x = self.proj(x)
         x = F.interpolate(x, self.target, mode='bicubic')
         return x
+
