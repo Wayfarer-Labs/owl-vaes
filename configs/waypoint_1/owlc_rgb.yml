@@ -1,0 +1,59 @@
+model:
+  model_id: dcae
+  sample_size: [360, 640]
+  channels: 3
+  latent_size: 16
+  latent_channels: 64
+
+  ch_0: 256
+  ch_max: 2048
+
+  encoder_blocks_per_stage: [8, 8, 8, 8, 8]
+  decoder_blocks_per_stage: [8, 8, 8, 8, 8]
+
+  use_middle_block: false
+  do_channel_mask: false
+
+train:
+  trainer_id: rec
+  data_id: video_dir_loader
+  data_kwargs:
+    source: 
+     - /mnt/data/datasets/extracted_tars/kbm/fps/*/*.mp4
+     - /mnt/data/datasets/extracted_tars/kbm/3ps/*/*.mp4
+     - /mnt/data/datasets/extracted_tars/kbm/other/*/*.mp4
+
+  target_batch_size: 32
+  batch_size: 4
+
+  epochs: 200
+
+  opt: AdamW
+  opt_kwargs:
+    lr: 3.0e-5
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.95]
+    eps: 1.0e-15
+
+  lpips_type: convnext
+  loss_weights:
+    kl: 1.0e-6
+    lpips: 12.0
+    #l2: 1.0
+    l1: 1.0
+
+  scheduler: LinearWarmup
+  scheduler_kwargs:
+    warmup_steps: 3000
+    min_lr: 3.0e-6
+
+  checkpoint_dir: checkpoints/waypoint_1_vae_owlc_rgb
+  resume_ckpt: null
+
+  sample_interval: 1000
+  save_interval: 5000
+
+wandb:
+  name: shahbuland
+  project: new_vaes
+  run_name: waypoint_1_vae_owlc_rgb
