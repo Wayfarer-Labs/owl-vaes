@@ -21,9 +21,7 @@ from .base import BaseTrainer
 from ..losses.basic import latent_reg_loss
 from ..losses.dwt import dwt_loss_fn
 
-from ..nn.crt import CRT
-
-class RecTrainer(BaseTrainer):
+class RecLiveDepthTrainer(BaseTrainer):
     """
     Trainer for reconstruction only objective.
     Only does L2 + LPIPS
@@ -52,13 +50,17 @@ class RecTrainer(BaseTrainer):
 
         self.total_step_counter = 0
 
-        self.crt = None
-        if self.train_cfg.loss_weights.get('crt', 0.0) > 0.0:
-            self.crt = CRT(self.model_cfg.latent_channels)
-            self.crt_opt = None
-
         self.do_channel_mask = getattr(self.train_cfg, 'channel_mask', False)
         self.model_input_size = [int(self.model_cfg.sample_size[0]), int(self.model_cfg.sample_size[1])]
+
+        import sys
+        sys.path.append("./FlashDepth")
+        from flashdepth import FlashDepthModel
+        self.depth = FlashDepthModel(
+            model_size='vits',
+            use_mamba=False,
+            checkpoint_path='FlashDepth/configs/flashdepth/iter_43002.pth'
+        )
 
     def save(self):
         save_dict = {
@@ -69,9 +71,6 @@ class RecTrainer(BaseTrainer):
             'scaler' : self.scaler.state_dict(),
             'steps': self.total_step_counter
         }
-        if self.crt is not None:
-            save_dict['crt'] = self.crt.state_dict()
-            save_dict['crt_opt'] = self.crt_opt.state_dict()
 
         super().save(save_dict)
 
@@ -88,10 +87,6 @@ class RecTrainer(BaseTrainer):
         self.scaler.load_state_dict(save_dict['scaler'])
         self.total_step_counter = save_dict['steps']
 
-        if self.crt is not None:
-            self.crt.load_state_dict(save_dict['crt'])
-            self.crt_opt.load_state_dict(save_dict['crt_opt'])
-
     def train(self):
         torch.cuda.set_device(self.local_rank)
 
@@ -101,24 +96,15 @@ class RecTrainer(BaseTrainer):
         dwt_weight = self.train_cfg.loss_weights.get('dwt', 0.0)
         l1_weight = self.train_cfg.loss_weights.get('l1', 0.0)
         l2_weight = self.train_cfg.loss_weights.get('l2', 0.0)
-        crt_weight = self.train_cfg.loss_weights.get('crt', 0.0)
-
-        def warmup_crt_weight():
-            if self.total_step_counter >= 1000:
-                return crt_weight
-            progress = self.total_step_counter / 1000
-            progress = min(1.0, max(0.0, progress))
-            return crt_weight * (1 - np.cos(progress * np.pi)) / 2
 
         # Prepare model, lpips, ema
         self.model = self.model.cuda().train()
-        if self.crt is not None:
-            self.crt = self.crt.cuda().train()
         if self.world_size > 1:
-            self.model = DDP(self.model, find_unused_parameters=(self.crt is not None))
-            if self.crt is not None:
-                self.crt = DDP(self.crt, find_unused_parameters=True)
-                freeze(self.crt)
+            self.model = DDP(self.model)
+
+        # Depth prep
+        self.depth = self.depth.to(self.device).bfloat16()
+        self.depth = torch.compile(self.depth)
 
         lpips = None
         if lpips_weight > 0.0:
@@ -137,9 +123,6 @@ class RecTrainer(BaseTrainer):
             self.opt = init_muon(self.model, rank=self.rank,world_size=self.world_size,**self.train_cfg.opt_kwargs)
         else:
             self.opt = getattr(torch.optim, self.train_cfg.opt)(self.model.parameters(), **self.train_cfg.opt_kwargs)
-
-        if self.crt is not None:
-            self.crt_opt = getattr(torch.optim, self.train_cfg.opt)(self.crt.parameters(), **self.train_cfg.opt_kwargs)
 
         if self.train_cfg.scheduler is not None:
             self.scheduler = get_scheduler_cls(self.train_cfg.scheduler)(self.opt, **self.train_cfg.scheduler_kwargs)
@@ -166,27 +149,16 @@ class RecTrainer(BaseTrainer):
         for _ in range(self.train_cfg.epochs):
             for batch in loader:
                 total_loss = 0.
-                if isinstance(batch,list) or isinstance(batch,tuple):
-                    batch = torch.cat(batch, dim=1)
                 batch = batch.to(self.device).bfloat16()
+                depth = self.depth(batch).unsqueeze(1)
 
+                batch = torch.cat([batch, depth], dim = 1)
                 full_batch = batch.clone()
                 batch = F.interpolate(batch, self.model_input_size, mode='bilinear', align_corners=False)
 
                 with ctx:
                     batch_rec, mu, logvar = self.model(batch)
                     z = mu # For logging
-
-                    if self.crt is not None:
-                        # z is [b,c,h,w], we want [b,hw,c]
-                        z_flat = eo.rearrange(z, 'b c h w -> b (h w) c')
-                        unfreeze(self.crt)
-                        crt_loss_local = self.crt(z_flat.detach()) / accum_steps
-                        self.scaler.scale(crt_loss_local).backward()
-                        freeze(self.crt)
-                        crt_loss = self.crt(z_flat) / accum_steps
-                        metrics.log('crt_loss', crt_loss)
-                        total_loss += warmup_crt_weight() * crt_loss
  
                     if kl_weight > 0.0:
                         reg_loss = latent_reg_loss(mu, logvar) / accum_steps
@@ -232,12 +204,6 @@ class RecTrainer(BaseTrainer):
                     self.scaler.step(self.opt)
                     self.opt.zero_grad(set_to_none=True)
 
-                    if self.crt is not None:
-                        self.scaler.unscale_(self.crt_opt)
-                        torch.nn.utils.clip_grad_norm_(self.crt.parameters(), max_norm=10.0)
-                        self.scaler.step(self.crt_opt)
-                        self.crt_opt.zero_grad(set_to_none=True)
-
                     self.scaler.update()
 
                     if self.scheduler is not None:
@@ -256,30 +222,17 @@ class RecTrainer(BaseTrainer):
                                 full_batch_rec = self.model(full_batch)[0]
                             
                             wandb_dict['samples'] = to_wandb(
-                                full_batch.detach().contiguous().bfloat16(),
-                                full_batch_rec.detach().contiguous().bfloat16(),
+                                full_batch[:,:3].detach().contiguous().bfloat16(),
+                                full_batch_rec[:,:3].detach().contiguous().bfloat16(),
                                 gather = False
                             )
                             
-                            # Log depth maps if present (4 or 7 channels)
-                            if batch.shape[1] >= 4:
-                                depth_samples = to_wandb_grayscale(
-                                    batch[:,3].unsqueeze(1).detach().contiguous().bfloat16(),
-                                    batch_rec[:,3].unsqueeze(1).detach().contiguous().bfloat16(),
-                                    gather = False
-                                )
-                                if depth_samples:
-                                    wandb_dict['depth_samples'] = depth_samples
-                            
-                            if batch.shape[1] == 5:
-                                # Pose
-                                pose_samples = to_wandb_grayscale(
-                                    batch[:,4].unsqueeze(1).detach().contiguous().bfloat16(),
-                                    batch_rec[:,4].unsqueeze(1).detach().contiguous().bfloat16(),
-                                    gather = False
-                                )
-                                if pose_samples:
-                                    wandb_dict['pose_samples'] = pose_samples
+                            depth_samples = to_wandb_grayscale(
+                                full_batch[:,3].unsqueeze(1).detach().contiguous().bfloat16(),
+                                full_batch_rec[:,3].unsqueeze(1).detach().contiguous().bfloat16(),
+                                gather = False
+                            )
+                            wandb_dict['depth_samples'] = depth_samples
                         
                         if self.rank == 0:
                             wandb.log(wandb_dict)
