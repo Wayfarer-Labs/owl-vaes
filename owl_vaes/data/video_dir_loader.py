@@ -95,7 +95,7 @@ class RandomRGBFromMP4s:
         # Light speed knobs (don’t persist beyond this call anyway)
         try:
             vstream.thread_type = "FRAME"
-            vstream.codec_context.thread_count = 0
+            vstream.codec_context.thread_count = 1
             vstream.codec_context.skip_loop_filter = "ALL"
         except Exception:
             pass
@@ -152,17 +152,18 @@ class RandomRGBDataset(IterableDataset):
     Infinite stream of CHW uint8 frames. One independent generator per worker.
     Assumes frames share a common resolution so default collate can stack.
     """
-    def __init__(self, source, seed: int = 0):
+    def __init__(self, source, seed: int = 0, target_size = (360, 640)):
         super().__init__()
         self.source = source
         self.seed = int(seed)
+        self.target_size = target_size
 
     def __iter__(self):
         info = get_worker_info()
         wid = info.id if info else 0
         # Derive a per-worker seed (works with persistent workers)
         wseed = (torch.initial_seed() + self.seed + wid) % (2**32)
-        rng = RandomRGBFromMP4s(self.source, seed=int(wseed))
+        rng = RandomRGBFromMP4s(self.source, seed=int(wseed), target_size = self.target_size)
         for rgb in rng:
             # HWC uint8 -> CHW uint8; clone() gives the tensor its own
             # resizable storage, preventing rare ‘resize_ not allowed’ errors.
@@ -180,15 +181,16 @@ def get_loader(batch_size, **data_kwargs):
         persistent_workers=True,
         prefetch_factor=2,
         drop_last=True,
+        multiprocessing_context="spawn",
     )
 
 
 if __name__ == "__main__":
     import time
-    loader = get_loader(4, source="/mnt/data/datasets/extracted_tars/kbm/fps/*/*.mp4")
+    loader = get_loader(32, source="/mnt/data/datasets/extracted_tars/kbm/fps/*/*.mp4", target_size = (360, 640))
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     loader = iter(loader)
-    for i in range(200):
+    for i in range(1000):
         t0 = time.time()
         batch_u8 = next(loader)
         t1 = time.time()
