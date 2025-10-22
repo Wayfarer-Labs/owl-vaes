@@ -45,5 +45,11 @@ def get_trainer_cls(trainer_id: Literal["rec", "proxy", "audio_rec"]):
         case "caus_distill_dec":
             from .caus_distill_dec import CausalDistillDecoderTrainer
             return CausalDistillDecoderTrainer
+        case "rec_depth":
+            from .rec_live_depth import RecLiveDepthTrainer
+            return RecLiveDepthTrainer
+        case "distill_depth_enc":
+            from .distill_depth_enc import DistillDepthEncTrainer
+            return DistillDepthEncTrainer
         case _:
             raise NotImplementedError

@@ -58,6 +58,7 @@ class RecTrainer(BaseTrainer):
             self.crt_opt = None
 
         self.do_channel_mask = getattr(self.train_cfg, 'channel_mask', False)
+        self.model_input_size = [int(self.model_cfg.sample_size[0]), int(self.model_cfg.sample_size[1])]
 
     def save(self):
         save_dict = {
@@ -168,6 +169,10 @@ class RecTrainer(BaseTrainer):
                 if isinstance(batch,list) or isinstance(batch,tuple):
                     batch = torch.cat(batch, dim=1)
                 batch = batch.to(self.device).bfloat16()
+
+                full_batch = batch.clone()
+                batch = F.interpolate(batch, self.model_input_size, mode='bilinear', align_corners=False)
+
                 with ctx:
                     batch_rec, mu, logvar = self.model(batch)
                     z = mu # For logging
@@ -247,9 +252,12 @@ class RecTrainer(BaseTrainer):
                         timer.reset()
 
                         if self.total_step_counter % self.train_cfg.sample_interval == 0:
+                            with ctx:
+                                full_batch_rec = self.model(full_batch)[0]
+                            
                             wandb_dict['samples'] = to_wandb(
-                                batch.detach().contiguous().bfloat16(),
-                                batch_rec.detach().contiguous().bfloat16(),
+                                full_batch.detach().contiguous().bfloat16(),
+                                full_batch_rec.detach().contiguous().bfloat16(),
                                 gather = False
                             )
                             
