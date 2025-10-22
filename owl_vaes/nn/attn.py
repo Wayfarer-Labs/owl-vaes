@@ -2,7 +2,7 @@ import einops as eo
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.nn.attention.flex_attention import flex_attention
+#from torch.nn.attention.flex_attention import flex_attention
 
 from owl_vaes.configs import TransformerConfig
 
@@ -13,18 +13,10 @@ from .rope import get_rope_impl
 
 
 torch.backends.cuda.enable_flash_sdp(enabled=True)
-flex_attention = torch.compile(flex_attention)
+#flex_attention = torch.compile(flex_attention)
 
 from einops._torch_specific import allow_ops_in_compiled_graph
 allow_ops_in_compiled_graph()
-
-try:
-    from flash_cosine_sim_attention import flash_cosine_sim_attention
-except:
-    print("Warning: Failed to import Flash Cosine Attn. It's only needed for HDiT so you can ignore if not needed.")
-
-from torch.nn.attention.flex_attention import flex_attention
-flex_attention = torch.compile(flex_attention)
 
 class Attn(nn.Module):
     def __init__(self, config : TransformerConfig):

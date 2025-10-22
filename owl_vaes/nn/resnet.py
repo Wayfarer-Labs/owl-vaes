@@ -2,6 +2,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 import torch
+import math
 
 from .normalization import RMSNorm2d, GroupNorm
 from torch.nn.utils.parametrizations import weight_norm
@@ -170,7 +171,7 @@ def find_nearest_square(h, w):
     area = h * w
     side = round((area)**0.5)
     # Find nearest power of 2
-    power = round(torch.log2(torch.tensor(side)).item())
+    power = round(math.log2(side))
     side = 2**power
     return side, side
 
@@ -181,9 +182,13 @@ def find_nearest_landscape(h, w):
     
     # Define common 9:16 resolutions
     resolutions = [
+        (45, 80),
+        (90, 160),
+        (180, 320),
         (360, 640),
         (720, 1280), 
-        (1080, 1920)
+        (1080, 1920),
+        (2160, 3840)
     ]
     
     # Find closest resolution by area
@@ -200,33 +205,32 @@ def find_nearest_landscape(h, w):
     return h_new, w_new
     
 class LandscapeToSquare(nn.Module):
-    def __init__(self, landscape_size, ch, ch_out = None):
+    def __init__(self, ch, ch_out = None):
         super().__init__()
-
-        h,w = landscape_size
-        self.target = find_nearest_square(h,w)
 
         if ch_out is None: ch_out = ch
         self.proj = WeightNormConv2d(ch, ch_out, 3, 1, 1)
     
     def forward(self, x):
         # x is [9, 16]
-        x = F.interpolate(x, self.target, mode='bicubic')
+        _,_,h,w = x.shape
+        target = find_nearest_square(h,w)
+        x = F.interpolate(x, target, mode='bicubic')
         x = self.proj(x)
         return x
 
 class SquareToLandscape(nn.Module):
-    def __init__(self, landscape_size, ch, ch_out = None):
+    def __init__(self, ch, ch_out = None):
         super().__init__()
-
-        self.target = tuple(landscape_size)
 
         if ch_out is None: ch_out = ch
         self.proj = WeightNormConv2d(ch, ch_out, 3, 1, 1)
 
     def forward(self, x):
         # x is [1,1]
+        _,_,h,w = x.shape
+        target = find_nearest_landscape(h,w)
         x = self.proj(x)
-        x = F.interpolate(x, self.target, mode='bicubic')
+        x = F.interpolate(x, target, mode='bicubic')
         return x
 

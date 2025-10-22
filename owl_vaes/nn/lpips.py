@@ -39,8 +39,33 @@ class VGGLPIPS(nn.Module):
 
         return self.model(x_fake, x_real).mean()
 
+def is_landscape(h,w):
+    return w > h
+
+def landscape_patchify(x):
+    # Experimental
+    x = F.interpolate(x, (360, 640), mode='bicubic')
+
+    patch_tl = x[:,:,:256,:256]
+    patch_tm = x[:,:,:256,(640//2 - 128):(640//2 + 128)]
+    patch_tr = x[:,:,:256,-256:]
+    patch_bl = x[:,:,-256:,:256]
+    patch_bm = x[:,:,-256:,(640//2 - 128):(640//2 + 128)]
+    patch_br = x[:,:,-256:,-256:]
+
+    return torch.cat([
+        patch_tl,
+        patch_tm,
+        patch_tr,
+        patch_bl,
+        patch_bm,
+        patch_br,
+    ], dim=0)
+
 def cn_patchify(x):
     _, _, h, w = x.shape
+    if is_landscape(h,w):
+        return landscape_patchify(x)
     if h <= 256 and w <= 256:
         return x
         
