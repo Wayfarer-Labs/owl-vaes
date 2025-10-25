@@ -11,14 +11,19 @@ def stft_loss(
     """
     Multi-scale STFT loss for audio reconstruction
     Using view_as_real to properly handle complex tensors
+
+    Args:
+        x_rec: Reconstructed audio (B, N, D) where N=samples, D=channels
+        x_target: Target audio (B, N, D)
     """
     total_loss = 0.0
 
     x_rec = x_rec.to(torch.float32)
     x_target = x_target.to(torch.float32)
 
-    x_rec = x_rec.contiguous()
-    x_target = x_target.contiguous()
+    # Transpose from (B, N, D) to (B, D, N) for STFT
+    x_rec = x_rec.transpose(1, 2).contiguous()
+    x_target = x_target.transpose(1, 2).contiguous()
 
     for n_fft in n_fft_list:
         hop_length = int(n_fft * hop_length_ratio)
@@ -60,23 +65,23 @@ def lr_to_ms(audio: Tensor) -> Tensor:
     Convert Left-Right (L/R) stereo to Mid-Side (M/S)
 
     Args:
-        audio: Input audio tensor (B, 2, T) where channel 0=L, channel 1=R
+        audio: Input audio tensor (B, N, D) where N=samples, D=2 channels (L, R)
 
     Returns:
-        Audio in M/S format (B, 2, T) where channel 0=M, channel 1=S
+        Audio in M/S format (B, N, D) where D=2 channels (M, S)
     """
-    if audio.size(1) != 2:
+    if audio.size(-1) != 2:
         return audio
 
-    left = audio[:, 0:1, :].clone()  # (B, 1, T)
-    right = audio[:, 1:2, :].clone()  # (B, 1, T)
+    left = audio[..., 0:1].clone()  # (B, N, 1)
+    right = audio[..., 1:2].clone()  # (B, N, 1)
 
     mid = (
         left + right
     ) * 0.5  # Mid channel - use multiplication for better compilation
     side = (left - right) * 0.5  # Side channel
 
-    return torch.cat([mid, side], dim=1)
+    return torch.cat([mid, side], dim=-1)
 
 #@torch.compile(mode="max-autotune")
 def compute_ms_loss(batch_rec: Tensor, batch: Tensor) -> Tensor:

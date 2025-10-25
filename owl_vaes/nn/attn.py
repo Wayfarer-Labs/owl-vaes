@@ -39,7 +39,7 @@ class Attn(nn.Module):
 
         nn.init.zeros_(self.out.weight)
 
-    def forward(self, x, kv_cache = None, tread_mask = None):
+    def forward(self, x, kv_cache = None, attn_mask = None):
         # x: [b, n, d_model]
         b, n, d_model = x.shape
         h = self.n_heads
@@ -53,8 +53,8 @@ class Attn(nn.Module):
 
         q, k = self.qk_norm(q, k)
         if self.rope is not None:
-            q, k = self.rope(q, k, tread_mask)
-        x_out = F.scaled_dot_product_attention(q, k, v, is_causal = self.causal)
+            q, k = self.rope(q, k)
+        x_out = F.scaled_dot_product_attention(q, k, v, is_causal = self.causal, attn_mask = attn_mask)
         #x_out = flex_attention(q,k,v)
         x_out = x_out.to(x.dtype)
 
@@ -158,10 +158,10 @@ class Transformer(nn.Module):
         self.attn = Attn(config)
         self.mlp = MLP(config)
 
-    def forward(self, x, kv_cache = None):
+    def forward(self, x, kv_cache = None, attn_mask = None):
         res1 = x.clone()
         x = self.norm1(x)
-        x = self.attn(x, kv_cache)
+        x = self.attn(x, kv_cache, attn_mask)
         x = res1 + x
 
         res2 = x.clone()
@@ -181,9 +181,9 @@ class StackedTransformer(nn.Module):
             blocks[i].attn.layer_ind = i
         self.blocks = nn.ModuleList(blocks)
 
-    def forward(self, x, kv_cache = None):
+    def forward(self, x, kv_cache = None, attn_mask = None):
         for block in self.blocks:
-            x = block(x, kv_cache)
+            x = block(x, kv_cache, attn_mask)
 
         return x
 
