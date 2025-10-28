@@ -5,10 +5,26 @@ import einops as eo
 
 from ..nn.attn import StackedTransformer
 
-def create_attn_mask(b, n_audio_tokens, n_latent_tokens):
+def create_attn_mask(b, n_audio_tokens, n_latent_tokens, device, dtype):
+    N = n_audio_tokens
+    L = n_latent_tokens
+
+    N_per_L = N // L
+
     # Assume that in the video
-    attn_mask = torch.ones(n_audio_tokens+n_latent_tokens, n_audio_tokens+n_latent_tokens) * -float('inf')
-    pass
+    attn_mask = torch.ones(N+L, N+L, device=device, dtype=dtype) * -float('inf')
+    for i in range(N):
+        # attn to everything before and including i
+        attn_mask[i,:i+1] = 0.0
+    for i in range(L):
+        # attn to previous latent tokens
+        attn_mask[N+i,N:N+i+1] = 0.0
+
+        # attn to relevant audio sample tokens
+        attn_mask[N+i,:N_per_L*(i+1)] = 0.0
+    
+    return attn_mask
+
 
 class CausalAudioEncoder(nn.Module):
     def __init__(self, config : 'TransformerConfig'):
@@ -29,7 +45,7 @@ class CausalAudioEncoder(nn.Module):
 
         self.transformer = StackedTransformer(config)
 
-    def forward(self, x):
+    def forward(self, x, attn_mask = None):
         # x is [b,n,2]
         b,n,d = x.shape
         x = eo.rearrange(x, 'b (n p) d -> b n (p d)', p = self.p)
@@ -38,8 +54,11 @@ class CausalAudioEncoder(nn.Module):
 
         z = eo.repeat(self.latent_starter, 'd -> b n d', b = b, n = self.n_latents)
 
+        if attn_mask is None:
+            attn_mask = create_attn_mask(b, n, self.n_latents, x.device, x.dtype)
+
         x = torch.cat([x, z], dim=1)
-        x = self.transformer(x)
+        x = self.transformer(x, attn_mask = attn_mask)
         z = x[:,n:]
 
         mu = self.proj_out_mu(z)
