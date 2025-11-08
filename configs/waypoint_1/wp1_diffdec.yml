@@ -4,9 +4,9 @@ model:
   channels: 64
   latent_size: 16
   latent_channels: 64
-  patch_size: [5,4]
+  patch_size: [5,2]
 
-  n_layers: 24
+  n_layers: 28
   n_heads: 24
   d_model: 1536
 
@@ -16,7 +16,7 @@ model:
   backbone: dit
   rope_impl: image+latent
   dropout: 0.1
-  shuffle_factor: 2
+  shuffle_factor: 1
   cfg_prob: 0.1
 
 train:
@@ -25,10 +25,10 @@ train:
   data_kwargs:
     source: 
      - /mnt/data/waypoint_1/data/MKIF/*/*.mp4
-    target_size: [720, 1280]
+    target_size: [360, 640]
 
-  target_batch_size: 256
-  batch_size: 32
+  target_batch_size: 128
+  batch_size: 16
 
   epochs: 200
 
@@ -41,7 +41,7 @@ train:
 
   opt: Muon
   opt_kwargs:
-    lr: 1.0e-3
+    lr: 1.0e-2
     momentum: 0.95
     adamw_lr: 1.0e-4
     adamw_wd: 1.0e-4
