@@ -184,7 +184,7 @@ class DiffDecLiveDepthTrainer(BaseTrainer):
                         proxy_z = proxy_z / self.train_cfg.ldm_scale # [b,16,45,80]
 
                     diff_loss = self.model(proxy_z, teacher_z)
-                    diff_loss = diff_loss / accum_steps
+                    diff_loss = diff_loss
 
                 metrics.log('diff_loss', diff_loss)
                 total_loss += diff_loss

@@ -52,14 +52,10 @@ train:
       - core.proj_out
       - core.ts_embed
       - core.final
-      - .adaln1_1
-      - .adaln1_2
-      - .gate1_1
-      - .gate1_2
-      - .adaln2_1
-      - .adaln2_2
-      - .gate2_1
-      - .gate2_2
+      - .adaln1
+      - .adaln2
+      - .gate1
+      - .gate2
 
 
   checkpoint_dir: checkpoints/wp1_720p_diffdec
