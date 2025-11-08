@@ -187,7 +187,12 @@ def get_loader(batch_size, **data_kwargs):
 
 if __name__ == "__main__":
     import time
-    loader = get_loader(32, source="/mnt/data/datasets/extracted_tars/kbm/fps/*/*.mp4", target_size = (360, 640))
+    #loader = get_loader(32, source="/mnt/data/datasets/extracted_tars/kbm/fps/*/*.mp4", target_size = (360, 640))
+    loader = get_loader(
+        4,
+        source="/mnt/data/waypoint_1/data/MKIF/*/*.mp4",
+        target_size = (720,1280)
+    )
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     loader = iter(loader)
     for i in range(1000):

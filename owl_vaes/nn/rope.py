@@ -51,8 +51,10 @@ class SimpleRoPE(nn.Module):
     """
     1D Rotary Positional Embedding for sequence data.
     """
-    def __init__(self, d_model, n_heads):
+    def __init__(self, config):
         super().__init__()
+        d_model = config.d_model
+        n_heads = config.n_heads
         self.dim_head = d_model // n_heads
         self.rope = RotaryEmbedding(self.dim_head, freqs_for="lang", theta = 300)
 

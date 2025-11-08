@@ -119,11 +119,18 @@ class CombinedOptimizer(Optimizer):
         self.defaults = {}
 
         adamw_keys = kwargs.pop('adamw_keys', [])
-        if world_size > 1:
-            adamw_keys = ['module.' + key for key in adamw_keys]
 
         adamw_parameters = [p for n, p in model.named_parameters() if any(key in n for key in adamw_keys) or p.ndim < 2]
         muon_parameters = [p for n, p in model.named_parameters() if not any(key in n for key in adamw_keys) and p.ndim >= 2]
+
+        unmatched_keys = []
+        named_parameters = dict(model.named_parameters())
+        for key in adamw_keys:
+            matched = any(key in name for name in named_parameters.keys())
+            if not matched:
+                unmatched_keys.append(key)
+        if unmatched_keys:
+            print(f"Warning: The following adamw_keys were specified but none were matched in the model parameters: {unmatched_keys}")
 
         # Initialize sub-optimizers
         self.adamw = AdamW(
