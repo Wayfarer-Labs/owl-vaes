@@ -69,6 +69,10 @@ class DiffusionDecoderCore(nn.Module):
 
         # Convert from image format [b,c,h,w] to patches [b,n_patches,patch_size*patch_size*c]
         b, c, h, w = x.shape
+
+        print(x.shape)
+        print(self.n_p_y, self.p_y, self.n_p_x, self.p_x)
+        exit()
         x = x.view(b, c, self.n_p_y, self.p_y, self.n_p_x, self.p_x)
         x = x.permute(0, 2, 4, 3, 5, 1).contiguous()
         x = x.view(b, self.n_p_y * self.n_p_x, self.p_y * self.p_x * c)
