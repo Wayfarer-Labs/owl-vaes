@@ -1,7 +1,7 @@
 model:
   model_id: diff_dec
   sample_size: [45, 80]
-  channels: 64
+  channels: 16
   latent_size: 16
   latent_channels: 64
   patch_size: [5,2]
