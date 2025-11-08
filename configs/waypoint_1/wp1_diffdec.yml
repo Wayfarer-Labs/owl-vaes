@@ -1,7 +1,7 @@
 model:
   model_id: diff_dec
   sample_size: [45, 80]
-  channels: 16
+  channels: 64
   latent_size: 16
   latent_channels: 64
   patch_size: [5,4]
@@ -16,6 +16,7 @@ model:
   backbone: dit
   rope_impl: image+latent
   dropout: 0.1
+  shuffle_factor: 2
 
 train:
   trainer_id: proxy_diffdec

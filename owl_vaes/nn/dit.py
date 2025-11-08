@@ -6,30 +6,6 @@ from .attn import MMAttn, Attn
 from .mlp import MLP
 from .modulation import AdaLN, Gate
 
-def scatter(full_x: torch.Tensor, x: torch.Tensor, mask: torch.Tensor):
-    """
-    full_x: [b, n, d]  (destination buffer; modified in-place)
-    x:      [b, m, d]  (values to insert)
-    mask:   [b, n]     (exactly m True per row)
-
-    Returns: full_x with x scattered into positions where mask==True (per batch row).
-    """
-    assert full_x.dim() == 3 and x.dim() == 3 and mask.dim() == 2
-    b, n, d = full_x.shape
-    bb, m, dd = x.shape
-    bm, nm = mask.shape
-    assert b == bb == bm and n == nm and d == dd, "shape mismatch"
-
-    # Build per-row indices of True positions -> [b, m]
-    sel_idx = torch.arange(n, device=x.device).expand(b, n)[mask].reshape(b, m)
-
-    # Expand to match [b, m, d], so we can scatter along dim=1 (the n-dimension)
-    index_n = sel_idx[:, :, None].expand(b, m, d)  # [b, m, d]
-
-    # In-place scatter
-    full_x.scatter_(dim=1, index=index_n, src=x)
-    return full_x
-
 class MMDiTBlock(nn.Module):
     def __init__(self, config : 'TransformerConfig'):
         super().__init__()
@@ -104,14 +80,14 @@ class DiTBlock(nn.Module):
         self.gate1 = Gate(config.d_model)
         self.gate2 = Gate(config.d_model)
 
-    def forward(self, x, cond, tread_mask = None):
+    def forward(self, x, cond):
         # x is [b,n,d]
         # cond is [b,d]
 
         # First block
         res1 = x.clone()
         x = self.adaln1(x, cond)
-        x = self.attn(x, tread_mask = tread_mask)
+        x = self.attn(x)
         x = self.gate1(x, cond)
         x = res1 + x
 
@@ -152,51 +128,12 @@ class DiT(nn.Module):
             blocks.append(DiTBlock(config))
         self.blocks = nn.ModuleList(blocks)
 
-        self.tread = False
-        if getattr(config, "tread", False):
-            self.tread = True
-            self.tread_i = 2
-            self.tread_j = config.n_layers - 4
-            self.tread_p = 0.5
-        
         self.config = config
         self.n_latents = config.latent_size**2
 
     def forward(self, x, cond):
-        if self.tread:
-            # Tread mask is FALSE -> skip those
-            # Create a mask with exactly 50% True and 50% False per batch element
-            b, n_image = x[:,:-self.n_latents,0].shape
-            n_true = n_image // 2
-            tread_mask = torch.zeros((b, n_image), dtype=torch.bool, device=x.device)
-            for i in range(b):
-                perm = torch.randperm(n_image, device=x.device)
-                tread_mask[i, perm[:n_true]] = True
-            tread_mask = torch.cat([tread_mask, torch.ones_like(x[:,:self.n_latents,0])], dim=1) # [b,n]
-            tread_mask = tread_mask.bool() # [b,n]
-            tread_mask_input = None
-
-            half_tokens = n_image // 2
-            full_x = None
-            full_x_heads = None
-        else:
-            tread_mask = None
-            tread_mask_input = None
-            full_x = None
-            full_x_heads = None
-
         for i, block in enumerate(self.blocks):
-            if self.tread:
-                if i == self.tread_i:
-                    full_x = x.clone()
-                    x = x[tread_mask].view(b, -1, self.config.d_model) # 50% of tokens
-                    tread_mask_input = tread_mask
-
-                elif i == self.tread_j:
-                    x = scatter(full_x, x, tread_mask)
-                    tread_mask_input = None
-
-            x = block(x, cond, tread_mask = tread_mask_input)
+            x = block(x, cond)
 
         return x
 

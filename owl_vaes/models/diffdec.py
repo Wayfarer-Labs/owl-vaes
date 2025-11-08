@@ -48,10 +48,6 @@ class DiffusionDecoderCore(nn.Module):
 
         self.final = FinalLayer(config, skip_proj = True)
 
-        self.p_y, self.p_x = patch_size
-        self.n_p_y = config.sample_size[0] // self.p_y
-        self.n_p_x = config.sample_size[1] // self.p_x
-
         if config.backbone == "dit":
             self.blocks = DiT(config)
         elif config.backbone == "hdit":
@@ -59,20 +55,25 @@ class DiffusionDecoderCore(nn.Module):
             self.blocks = HDiT(config)
         self.config = config
 
+        self.shuffle_factor = getattr(config, "shuffle_factor", 1)
+        self.p_y, self.p_x = patch_size
+        self.n_p_y = config.sample_size[0] // self.p_y
+        self.n_p_x = config.sample_size[1] // self.p_x
+
     def forward(self, x, z, ts):
         # x is [b,c,h,w]
         # z is [b,c,h,w] but different size cause latent
         # ts is [b,] in [0,1]
         # d is [b,] in [1,2,4,...,128]
 
+        if self.shuffle_factor > 1:
+            x = F.pixel_unshuffle(x, self.shuffle_factor)
+
         cond = self.ts_embed(ts)
 
         # Convert from image format [b,c,h,w] to patches [b,n_patches,patch_size*patch_size*c]
         b, c, h, w = x.shape
 
-        print(x.shape)
-        print(self.n_p_y, self.p_y, self.n_p_x, self.p_x)
-        exit()
         x = x.view(b, c, self.n_p_y, self.p_y, self.n_p_x, self.p_x)
         x = x.permute(0, 2, 4, 3, 5, 1).contiguous()
         x = x.view(b, self.n_p_y * self.n_p_x, self.p_y * self.p_x * c)
@@ -100,6 +101,9 @@ class DiffusionDecoderCore(nn.Module):
         x = x.view(b, self.n_p_y, self.n_p_x, self.p_y, self.p_x, c)
         x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
         x = x.view(b, c, self.n_p_y * self.p_y, self.n_p_x * self.p_x).contiguous()
+
+        if self.shuffle_factor > 1:
+            x = F.pixel_shuffle(x, self.shuffle_factor)
 
         return x
 
@@ -138,20 +142,23 @@ class DiffusionDecoder(nn.Module):
 
 if __name__ == "__main__":
     from ..configs import Config
+    import torch
+    import torch.nn.functional as F
+
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
     cfg = Config.from_yaml("configs/waypoint_1/wp1_diffdec.yml").model
 
     from diffusers import AutoencoderTiny
     vae = AutoencoderTiny.from_pretrained("madebyollin/taef1")
-    vae = vae.bfloat16().cuda()
+    vae = vae.float().to(device)  # bfloat16 not supported on mps
 
-    model = DiffusionDecoderCore(cfg).bfloat16().cuda()
-    x = torch.randn(1,3,720,1280).bfloat16().cuda()
-    z = torch.randn(1,64,16,16).bfloat16().cuda()
+    model = DiffusionDecoderCore(cfg).float().to(device)
+    x = torch.randn(1,3,720,1280).float().to(device)
+    z = torch.randn(1,64,16,16).float().to(device)
 
-    
     with torch.no_grad():
         proxy = vae.encoder(x)
-        print(proxy.shape, z.shape)
-        y = model(proxy, z, torch.tensor([0.5]).cuda().bfloat16())
-        print(y.shape)
+        y = model(proxy, z, torch.tensor([0.5]).to(device).float())
+        rec = vae.decoder(y)
+        print(rec.shape)
