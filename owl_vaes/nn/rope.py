@@ -126,7 +126,7 @@ class ImageRoPEWithLatent(nn.Module):
         rope_emb = RotaryEmbedding(
             dim_head // 4,
             freqs_for = 'pixel',
-            max_freq = 256
+            max_freq = min(n_p_y_rope, n_p_x_rope) * 0.8
         )
         freqs = rope_emb.get_axial_freqs(
             n_p_y_rope,
