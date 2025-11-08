@@ -7,7 +7,7 @@ def setup(force=True, timeout=1000):
 
     if not force:
         try:
-            dist.init_process_group(backend="nccl", **init_kwargs)
+            dist.init_process_group(backend="nccl", init_method="env://", **init_kwargs)
 
             global_rank = int(os.environ.get("RANK", 0))
             local_rank  = int(os.environ.get("LOCAL_RANK", 0))
@@ -17,7 +17,7 @@ def setup(force=True, timeout=1000):
         except:
             return 0, 0, 1
     else:
-        dist.init_process_group(backend="nccl", **init_kwargs)
+        dist.init_process_group(backend="nccl", init_method="env://", **init_kwargs)
 
         global_rank = int(os.environ.get("RANK", 0))
         local_rank  = int(os.environ.get("LOCAL_RANK", 0))

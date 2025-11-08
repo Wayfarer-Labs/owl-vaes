@@ -139,11 +139,19 @@ class DiffusionDecoder(nn.Module):
 if __name__ == "__main__":
     from ..configs import Config
 
-    cfg = Config.from_yaml("configs/cod_yt_v2/causal_diffdec.yml").model
+    cfg = Config.from_yaml("configs/waypoint_1/wp1_diffdec.yml").model
+
+    from diffusers import AutoencoderTiny
+    vae = AutoencoderTiny.from_pretrained("madebyollin/taef1")
+    vae = vae.bfloat16().cuda()
+
     model = DiffusionDecoderCore(cfg).bfloat16().cuda()
-    x = torch.randn(1,3,45,80).bfloat16().cuda()
+    x = torch.randn(1,3,720,1280).bfloat16().cuda()
     z = torch.randn(1,64,16,16).bfloat16().cuda()
+
+    
     with torch.no_grad():
-        y = model(x, z, torch.tensor([0.5]).cuda().bfloat16())
+        proxy = vae.encoder(x)
+        print(proxy.shape, z.shape)
+        y = model(proxy, z, torch.tensor([0.5]).cuda().bfloat16())
         print(y.shape)
-    print(cfg)

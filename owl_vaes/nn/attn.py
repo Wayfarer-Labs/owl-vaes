@@ -32,7 +32,7 @@ class Attn(nn.Module):
         if rope_impl is None:
             self.rope = None
         else:
-            self.rope = get_rope_impl(rope_impl)(config.d_model, config.n_heads)
+            self.rope = get_rope_impl(rope_impl)(config)
         self.causal = config.causal
 
         self.layer_ind = None

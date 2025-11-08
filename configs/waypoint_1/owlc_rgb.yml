@@ -2,7 +2,7 @@ model:
   model_id: dcae
   sample_size: [360, 640]
   channels: 3
-  latent_size: 16
+  latent_size: 8
   latent_channels: 64
 
   ch_0: 256
@@ -22,6 +22,7 @@ train:
      - /mnt/data/datasets/extracted_tars/kbm/fps/*/*.mp4
      - /mnt/data/datasets/extracted_tars/kbm/3ps/*/*.mp4
      - /mnt/data/datasets/extracted_tars/kbm/other/*/*.mp4
+    target_size: [360, 640]
 
   target_batch_size: 32
   batch_size: 4
@@ -48,7 +49,7 @@ train:
     min_lr: 3.0e-6
 
   checkpoint_dir: checkpoints/waypoint_1_vae_owlc_rgb
-  resume_ckpt: null
+  resume_ckpt: checkpoints/waypoint_1_vae_owlc_rgb/step_460000.pt
 
   sample_interval: 1000
   save_interval: 5000
