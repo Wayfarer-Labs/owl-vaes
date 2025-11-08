@@ -17,6 +17,7 @@ model:
   rope_impl: image+latent
   dropout: 0.1
   shuffle_factor: 2
+  cfg_prob: 0.1
 
 train:
   trainer_id: proxy_diffdec
@@ -52,6 +53,7 @@ train:
       - core.proj_out
       - core.ts_embed
       - core.final
+      - core.null_emb
       - .adaln1
       - .adaln2
       - .gate1
@@ -70,6 +72,7 @@ train:
   latent_scale: 0.69
   ldm_scale: 1.0
   sampling_steps: 20
+  cfg_scale: 1.5
 
 wandb:
   name: wayfarerlabs
