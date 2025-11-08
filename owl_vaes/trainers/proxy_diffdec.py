@@ -209,13 +209,15 @@ class DiffDecLiveDepthTrainer(BaseTrainer):
 
                     if self.total_step_counter % self.train_cfg.sample_interval == 0:
                         with ctx:
+                            cfg_scale = getattr(self.train_cfg, 'cfg_scale', 1.0)
                             ema_rec = flow_sample(
                                 self.get_ema_core(),
                                 proxy_z,
                                 teacher_z,
                                 self.train_cfg.sampling_steps,
                                 self.proxy.decoder,
-                                scaling_factor = self.train_cfg.ldm_scale
+                                scaling_factor = self.train_cfg.ldm_scale,
+                                cfg_scale = cfg_scale
                             )
 
                         wandb_dict['samples'] = to_wandb(

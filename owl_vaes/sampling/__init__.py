@@ -3,21 +3,43 @@ import torch
 from tqdm import tqdm
 
 @torch.no_grad()
-def flow_sample(model, dummy, z, steps, decoder=None, scaling_factor = 1.0, progress_bar = True):
+def flow_sample(model, dummy, z, steps, decoder=None, scaling_factor = 1.0, progress_bar = True, cfg_scale = 1.0):
     x = torch.randn_like(dummy)
     ts = torch.ones(len(z), device = z.device, dtype = z.dtype)
+
+    # Get null embedding from model if CFG is enabled
+    use_cfg = cfg_scale != 1.0
+    if use_cfg:
+        # Get null embedding - expand to batch size
+        null_emb = model.null_emb.unsqueeze(0).expand(len(z), -1, -1, -1)
 
     if steps > 1:
         dt = get_sd3_euler(steps).to(z.device)
         for i in tqdm(range(steps), disable = not progress_bar):
-            x = x - dt[i] * model(x, z, ts)
+            if use_cfg:
+                # Conditional prediction
+                pred_cond = model(x, z, ts)
+                # Unconditional prediction
+                pred_uncond = model(x, null_emb, ts)
+                # Apply CFG
+                pred = pred_uncond + cfg_scale * (pred_cond - pred_uncond)
+            else:
+                pred = model(x, z, ts)
+
+            x = x - dt[i] * pred
             ts = ts - dt[i]
     else:
-        x = x - model(x, z, ts)
+        if use_cfg:
+            pred_cond = model(x, z, ts)
+            pred_uncond = model(x, null_emb, ts)
+            pred = pred_uncond + cfg_scale * (pred_cond - pred_uncond)
+        else:
+            pred = model(x, z, ts)
+        x = x - pred
 
     if decoder is not None:
         x = x.bfloat16() * scaling_factor
         x = decoder(x)
     x = x.clamp(-1,1)
-    
+
     return x

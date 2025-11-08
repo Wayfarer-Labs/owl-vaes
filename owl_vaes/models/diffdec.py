@@ -60,6 +60,9 @@ class DiffusionDecoderCore(nn.Module):
         self.n_p_y = config.sample_size[0] // self.p_y
         self.n_p_x = config.sample_size[1] // self.p_x
 
+        # Learned null embedding for CFG
+        self.null_emb = nn.Parameter(torch.zeros(config.latent_channels, config.latent_size, config.latent_size))
+
     def forward(self, x, z, ts):
         # x is [b,c,h,w]
         # z is [b,c,h,w] but different size cause latent
@@ -115,6 +118,7 @@ class DiffusionDecoder(nn.Module):
 
         self.ts_mu = 0.4
         self.ts_sigma = 1.0
+        self.cfg_prob = getattr(config, "cfg_prob", 0.0)
 
     @torch.no_grad()
     def sample_timesteps(self, b, device, dtype):
@@ -133,6 +137,12 @@ class DiffusionDecoder(nn.Module):
 
             lerpd = x * (1. - ts_exp) + ts_exp * eps
             target = eps - x
+
+            # Apply CFG dropout: replace z with null embedding with probability cfg_prob
+            if self.cfg_prob > 0:
+                mask = torch.rand(len(z), device=z.device) < self.cfg_prob
+                z = z.clone()
+                z[mask] = self.core.null_emb.unsqueeze(0)
 
         pred = self.core(lerpd, z, ts)
         diff_loss = F.mse_loss(pred, target)
