@@ -110,7 +110,7 @@ class DiffDecLiveDepthTrainer(BaseTrainer):
         # Prepare model, lpips, ema
         self.model = self.model.to(self.device).train()
         if self.world_size > 1:
-            self.model = DDP(self.model)
+            self.model = DDP(self.model, find_unused_parameters=True)
         
         self.encoder = self.encoder.to(self.device).bfloat16()
         freeze(self.encoder)
