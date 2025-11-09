@@ -1,10 +1,10 @@
 model:
   model_id: diff_dec
-  sample_size: [90, 160]
-  channels: 64
+  sample_size: [135, 240]
+  channels: 16
   latent_size: 16
   latent_channels: 64
-  patch_size: [5,5]
+  patch_size: [27,24]
 
   n_layers: 28
   n_heads: 24
