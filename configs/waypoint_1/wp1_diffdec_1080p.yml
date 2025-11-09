@@ -16,7 +16,7 @@ model:
   backbone: dit
   rope_impl: image+latent
   dropout: 0.1
-  shuffle_factor: 2
+  shuffle_factor: 1
   cfg_prob: 0.1
 
 train:
