@@ -17,15 +17,15 @@ class MMDiTBlock(nn.Module):
         self.mlp1 = MLP(config)
         self.mlp2 = MLP(config)
 
-        self.adaln1_1 = AdaLN(config.d_model)
-        self.adaln1_2 = AdaLN(config.d_model)
-        self.gate1_1 = Gate(config.d_model)
-        self.gate1_2 = Gate(config.d_model)
+        self.adaln1_1 = AdaLN(config)
+        self.adaln1_2 = AdaLN(config)
+        self.gate1_1 = Gate(config)
+        self.gate1_2 = Gate(config)
 
-        self.adaln2_1 = AdaLN(config.d_model)
-        self.adaln2_2 = AdaLN(config.d_model)
-        self.gate2_1 = Gate(config.d_model)
-        self.gate2_2 = Gate(config.d_model)
+        self.adaln2_1 = AdaLN(config)
+        self.adaln2_2 = AdaLN(config)
+        self.gate2_1 = Gate(config)
+        self.gate2_2 = Gate(config)
 
         self.n = (config.sample_size // config.patch_size)
 
@@ -75,10 +75,10 @@ class DiTBlock(nn.Module):
         self.attn = Attn(config)
         self.mlp = MLP(config)
 
-        self.adaln1 = AdaLN(config.d_model)
-        self.adaln2 = AdaLN(config.d_model)
-        self.gate1 = Gate(config.d_model)
-        self.gate2 = Gate(config.d_model)
+        self.adaln1 = AdaLN(config)
+        self.adaln2 = AdaLN(config)
+        self.gate1 = Gate(config)
+        self.gate2 = Gate(config)
 
     def forward(self, x, cond):
         # x is [b,n,d]
@@ -108,7 +108,7 @@ class FinalLayer(nn.Module):
         d_model = config.d_model
         patch_size = config.patch_size
 
-        self.norm = AdaLN(d_model)
+        self.norm = AdaLN(config)
         self.act = nn.SiLU()
         self.proj = nn.Sequential() if skip_proj else nn.Linear(d_model, channels*patch_size*patch_size)
 
