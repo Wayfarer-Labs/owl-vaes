@@ -75,6 +75,6 @@ train:
   cfg_scale: 1.5
 
 wandb:
-  name: wayfarerlabs
-  project: hd_vaes
+  name: shahbuland
+  project: hq_vaes
   run_name: wp1_720p_diffdec
