@@ -14,6 +14,7 @@ from ..nn.dit import DiT, FinalLayer
 
 from ..nn.embeddings import LearnedPosEnc
 from ..nn.embeddings import TimestepEmbedding, StepEmbedding
+from ..nn.attn import get_attn_mask
 
 def is_landscape(sample_size):
     h,w = sample_size
@@ -76,10 +77,17 @@ class DiffusionDecoderCore(nn.Module):
         # Learned null embedding for CFG
         self.null_emb = nn.Parameter(torch.zeros(config.latent_channels, config.latent_size, config.latent_size))
 
-    def forward(self, x, z, ts):
+    def forward(self, x, z, ts, attn_mask = None):
         # x is [b,n,c,h,w]
         # z is [b,n,c,h,w] but different size cause latent
         # ts is [b,n] in [0,1] - per-frame timesteps
+
+        if attn_mask is None:
+            attn_mask = get_attn_mask(
+                self.config,
+                batch_size = x.shape[0],
+                device = x.device
+            )
 
         if self.shuffle_factor > 1:
             x = vid_pixel_unshuffle(x, self.shuffle_factor)
@@ -104,7 +112,7 @@ class DiffusionDecoderCore(nn.Module):
         n = x.shape[1]
         x = torch.cat([x,z],dim=1)
 
-        x = self.blocks(x, cond)
+        x = self.blocks(x, cond, attn_mask = attn_mask)
         x = x[:,:n]
 
         x = self.final(x, cond)

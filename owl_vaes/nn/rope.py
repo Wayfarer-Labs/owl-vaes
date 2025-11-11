@@ -5,14 +5,7 @@ import einops as eo
 
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 
-def int_to_tuple(x):
-    if isinstance(x, int):
-        return (x,x)
-    elif isinstance(x, tuple) or isinstance(x, list):
-        return x
-    else:
-        try:
-            return tuple(x)
+from ..utils import int_to_tuple
             
 def get_rope_impl(impl_name):
     impl_name = impl_name.lower()

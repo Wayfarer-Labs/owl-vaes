@@ -10,22 +10,13 @@ from .mimetic import mimetic_init
 from .mlp import MLP
 from .normalization import LayerNorm, QKNorm
 from .rope import get_rope_impl
-
+from ..utils import int_to_tuple
 
 torch.backends.cuda.enable_flash_sdp(enabled=True)
 flex_attention = torch.compile(flex_attention)
 
 from einops._torch_specific import allow_ops_in_compiled_graph
 allow_ops_in_compiled_graph()
-
-def int_to_tuple(x):
-    if isinstance(x, int):
-        return (x,x)
-    elif isinstance(x, tuple) or isinstance(x, list):
-        return x
-    else:
-        try:
-            return tuple(x)
 
 def get_attn_mask(
     config,
