@@ -168,6 +168,12 @@ class DiffDecLiveDepthTrainer(BaseTrainer):
             teacher_z = torch.randn_like(mu) * teacher_std + mu
             teacher_z = teacher_z / self.train_cfg.latent_scale
             return teacher_z
+        
+        @torch.no_grad()
+        def proxy_encode(batch):
+            proxy_z = self.proxy.encoder(batch[:,:3])
+            proxy_z = proxy_z / self.train_cfg.ldm_scale # [b,16,45,80]
+            return proxy_z
 
         for _ in range(self.train_cfg.epochs):
             for batch in loader:
@@ -177,12 +183,8 @@ class DiffDecLiveDepthTrainer(BaseTrainer):
                 with ctx:
                     with torch.no_grad():
                         teacher_z = teacher_sample(batch)
-                        teacher_z = teacher_z / self.train_cfg.latent_scale
-                        batch = batch[:,:3]
-
-                        proxy_z = self.proxy.encoder(batch)
-                        proxy_z = proxy_z / self.train_cfg.ldm_scale # [b,16,45,80]
-
+                        proxy_z = proxy_encode(batch)
+                        
                     diff_loss = self.model(proxy_z, teacher_z)
                     diff_loss = diff_loss
 

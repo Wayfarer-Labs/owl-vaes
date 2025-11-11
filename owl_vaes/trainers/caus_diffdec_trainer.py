@@ -1,36 +1,31 @@
+"""
+Trainer for distilling decoder with adversarial loss
+Combines image and audio training approaches with feature matching
+"""
+
 import einops as eo
 import torch
 import torch.nn.functional as F
 import wandb
 from ema_pytorch import EMA
 from torch.nn.parallel import DistributedDataParallel as DDP
+from copy import deepcopy
 
 from ..data import get_loader
 from ..models import get_model_cls
+from ..discriminators import get_discriminator_cls
 from ..muon import init_muon
+from ..nn.lpips import get_lpips_cls
 from ..schedulers import get_scheduler_cls
 from ..utils import Timer, freeze, unfreeze, versatile_load
-from ..utils.logging import LogHelper, to_wandb_video_sidebyside
+from ..utils.logging import LogHelper, to_wandb, to_wandb_grayscale
 from .base import BaseTrainer
 from ..configs import Config
+from ..sampling.causdiffdec import causal_diffdec_sample
 
-from ..sampling.diffdec_samplers import SameNoiseSampler
-
-from diffusers import AutoencoderTiny, AutoencoderDC
-import gc
-
-def get_vae(vae_id):
-    if vae_id == "taef1":
-        return AutoencoderTiny.from_pretrained("madebyollin/taef1")
-    elif vae_id == "dcae":
-        return AutoencoderDC.from_pretrained("mit-han-lab/dc-ae-f32c32-mix-1.0-diffusers")
-    else:
-        raise ValueError(f"VAE {vae_id} not found")
-
-class CausalDiffusionDecoderTrainer(BaseTrainer):
+class VideoDiffDecLiveDepthTrainer(BaseTrainer):
     """
-    Trainer for diffusion decoder with frozen encoder.
-    Does diffusion loss
+    Trainer for causal diffusion decoder with proxy VAE + depth encoder
 
     :param train_cfg: Configuration for training
     :param logging_cfg: Configuration for logging
@@ -49,14 +44,9 @@ class CausalDiffusionDecoderTrainer(BaseTrainer):
         teacher_cfg = Config.from_yaml(teacher_cfg_path).model
 
         teacher = get_model_cls(teacher_cfg.model_id)(teacher_cfg)
-        try:
-            teacher.load_state_dict(teacher_ckpt)
-        except Exception as e:
-            teacher.encoder.load_state_dict(teacher_ckpt)
+        teacher.load_state_dict(teacher_ckpt)
 
         self.encoder = teacher.encoder
-        self.teacher_cfg = teacher_cfg
-        self.teacher_size = teacher_cfg.sample_size
         del teacher.decoder
 
         model_id = self.model_cfg.model_id
@@ -68,15 +58,25 @@ class CausalDiffusionDecoderTrainer(BaseTrainer):
 
         self.ema = None
         self.opt = None
+        self.d_opt = None
         self.scheduler = None
         self.scaler = None
 
         self.total_step_counter = 0
 
-    def get_ema_core(self):
-        if self.world_size > 1:
-            return self.ema.ema_model.module.core
-        return self.ema.ema_model.core
+        # Depth 
+        import sys
+        sys.path.append("./FlashDepth")
+        from flashdepth import FlashDepthModel
+        self.depth = FlashDepthModel(
+            model_size='vits',
+            use_mamba=False,
+            checkpoint_path='FlashDepth/configs/flashdepth/iter_43002.pth'
+        )
+
+        # TAEF1
+        from diffusers import AutoencoderTiny
+        self.proxy = AutoencoderTiny.from_pretrained("madebyollin/taef1")
 
     def save(self):
         save_dict = {
@@ -86,62 +86,67 @@ class CausalDiffusionDecoderTrainer(BaseTrainer):
             'scaler' : self.scaler.state_dict(),
             'steps': self.total_step_counter
         }
-        if self.scheduler is not None:
-            save_dict['scheduler'] = self.scheduler.state_dict()
         super().save(save_dict)
 
     def load(self):
-        resume_ckpt = getattr(self.train_cfg, 'resume_ckpt', None)
-        if resume_ckpt is None:
+        if not hasattr(self.train_cfg, 'resume_ckpt') or self.train_cfg.resume_ckpt is None:
             return
-        save_dict = super().load(resume_ckpt)
-
-        self.model.load_state_dict(save_dict['model'], strict=False)
+        
+        save_dict = super().load(self.train_cfg.resume_ckpt)
+        self.model.load_state_dict(save_dict['model'])
         self.ema.load_state_dict(save_dict['ema'])
         self.opt.load_state_dict(save_dict['opt'])
-        if self.scheduler is not None and 'scheduler' in save_dict:
-            self.scheduler.load_state_dict(save_dict['scheduler'])
         self.scaler.load_state_dict(save_dict['scaler'])
         self.total_step_counter = save_dict['steps']
+    
+    def get_ema_core(self):
+        if self.world_size > 1:
+            return self.ema.ema_model.module.core
+        return self.ema.ema_model.core
 
     def train(self):
         torch.cuda.set_device(self.local_rank)
 
-        # Prepare model, ema
+        # Prepare model, lpips, ema
         self.model = self.model.to(self.device).train()
         if self.world_size > 1:
-            self.model = DDP(self.model)
-
-        self.encoder = self.encoder.to(self.device).bfloat16().train()
+            self.model = DDP(self.model, find_unused_parameters=True)
+        
+        self.encoder = self.encoder.to(self.device).bfloat16()
         freeze(self.encoder)
+        self.encoder = torch.compile(self.encoder)#, mode='max-autotune',dynamic=False,fullgraph=True)
+
+        # Depth prep
+        freeze(self.depth)
+        self.depth = self.depth.to(self.device).bfloat16()
+        self.depth = torch.compile(self.depth)
+
+        # TAEF1 prep
+        freeze(self.proxy)
+        self.proxy = self.proxy.to(self.device).bfloat16()
+        self.proxy.encoder = torch.compile(self.proxy.encoder)
+        self.proxy.decoder = torch.compile(self.proxy.decoder)
 
         self.ema = EMA(
             self.model,
-            beta = 0.999,
+            beta = 0.9999,
             update_after_step = 0,
             update_every = 1
         )
 
         # Set up optimizer and scheduler
+        opt_cls = getattr(torch.optim, self.train_cfg.opt)
+
         if self.train_cfg.opt.lower() == "muon":
             self.opt = init_muon(self.model, rank=self.rank,world_size=self.world_size,**self.train_cfg.opt_kwargs)
         else:
             opt_cls = getattr(torch.optim, self.train_cfg.opt)
             self.opt = opt_cls(self.model.parameters(), **self.train_cfg.opt_kwargs)
 
-        if self.train_cfg.scheduler is not None:
-            self.scheduler = get_scheduler_cls(self.train_cfg.scheduler)(self.opt, **self.train_cfg.scheduler_kwargs)
-
-        # Grad accum setup and scaler
-        accum_steps = self.train_cfg.target_batch_size // self.train_cfg.batch_size // self.world_size
-        accum_steps = max(1, accum_steps)
-
         self.scaler = torch.amp.GradScaler()
         ctx = torch.amp.autocast(self.device, torch.bfloat16)
 
         self.load()
-        torch.cuda.empty_cache()
-        gc.collect()
 
         # Timer reset
         timer = Timer()
@@ -152,100 +157,89 @@ class CausalDiffusionDecoderTrainer(BaseTrainer):
 
         # Dataset setup
         loader = get_loader(self.train_cfg.data_id, self.train_cfg.batch_size, **self.train_cfg.data_kwargs)
-        sample_loader = get_loader(
-            "local_latent",
-            1,
-            root_dir="/mnt/data/datasets/cod_yt_latents",
-            window_size=32
-        )
-        sample_loader = iter(sample_loader)
-        sampler = SameNoiseSampler(self.train_cfg.sampling_steps)
 
         @torch.no_grad()
-        def sample_from_teacher(batch_rgb, batch_depth):
-            t_input = torch.cat([batch_rgb, batch_depth], dim=1).cuda().bfloat16()
-            t_mu, t_logvar = self.encoder(t_input)
-            t_std = (t_logvar/2).exp()
-            t_z = torch.randn_like(t_mu) * t_std + t_mu
-            t_z = t_z / self.train_cfg.latent_scale
-            return t_z
+        def teacher_sample(batch):
+            b,n = batch.shape[:2]
+            batch = eo.rearrange(batch, 'b n ... -> (b n) ...')
+            batch = F.interpolate(batch, (360, 640), mode='bilinear', align_corners=False)
+            batch_depth = self.depth(batch).unsqueeze(1)
+            batch = torch.cat([batch, batch_depth], dim = 1)
+            mu, logvar = self.encoder(batch)
+            teacher_std = (logvar/2).exp()
+            teacher_z = torch.randn_like(mu) * teacher_std + mu
+            teacher_z = teacher_z / self.train_cfg.latent_scale
+            teacher_z = eo.rearrange(teacher_z, '(b n) ... -> b n ...', b = b, n = n)
+            return teacher_z
+        
+        @torch.no_grad()
+        def proxy_encode(batch):
+            b,n = batch.shape[:2]
+            batch = eo.rearrange(batch, 'b n ... -> (b n) ...')
+            proxy_z = self.proxy.encoder(batch[:,:3])
+            proxy_z = proxy_z / self.train_cfg.ldm_scale # [b,16,45,80]
+            proxy_z = eo.rearrange(proxy_z, '(b n) ... -> b n ...', b = b, n = n)
+            return proxy_z
 
-        sample_from_teacher = torch.compile(sample_from_teacher, mode = 'max-autotune', dynamic=False, fullgraph=True)
-
-        local_step = 0
         for _ in range(self.train_cfg.epochs):
-            for batch_rgb, batch_depth in loader:
-                batch_rgb = batch_rgb.to(self.device) # b3hw
-                batch_depth = batch_depth.to(self.device) # b1hw
-                
-                t_z = sample_from_teacher(batch_rgb, batch_depth)
+            for batch in loader:
+                total_loss = 0.
+                batch = batch.to(self.device).bfloat16()
 
                 with ctx:
-                    diff_loss = self.model(batch_rgb, t_z)
-                    diff_loss = diff_loss / accum_steps
+                    with torch.no_grad():
+                        teacher_z = teacher_sample(batch)
+                        proxy_z = proxy_encode(batch)
+                        
+                    diff_loss = self.model(proxy_z, teacher_z)
+                    diff_loss = diff_loss
 
                 metrics.log('diff_loss', diff_loss)
+                total_loss += diff_loss
+                self.scaler.scale(total_loss).backward()
 
-                self.scaler.scale(diff_loss).backward()
+                # Updates
+                if self.train_cfg.opt.lower() != "muon":
+                    self.scaler.unscale_(self.opt)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
 
-                local_step += 1
-                if local_step % accum_steps == 0:
-                    # Updates
-                    if self.train_cfg.opt.lower() != "muon":
-                        self.scaler.unscale_(self.opt)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.scaler.step(self.opt)
+                self.opt.zero_grad(set_to_none=True)
+                
+                self.scaler.update()
+                self.ema.update()
 
-                    self.scaler.step(self.opt)
-                    self.opt.zero_grad(set_to_none=True)
-                    
-                    self.scaler.update()
+                # Do logging stuff with sampling stuff in the middle
+                with torch.no_grad():
+                    wandb_dict = metrics.pop()
+                    wandb_dict['time'] = timer.hit()
+                    timer.reset()
 
-                    if self.scheduler is not None:
-                        self.scheduler.step()
-                    self.ema.update()
+                    if self.total_step_counter % self.train_cfg.sample_interval == 0:
+                        with ctx:
+                            cfg_scale = getattr(self.train_cfg, 'cfg_scale', 1.0)
+                            ema_rec = causal_diffdec_sample(
+                                self.get_ema_core(),
+                                proxy_z,
+                                teacher_z,
+                                self.train_cfg.sampling_steps,
+                                self.proxy.decoder,
+                                scaling_factor = self.train_cfg.ldm_scale,
+                                cfg_scale = cfg_scale
+                            )
 
-                    # Do logging stuff with sampling stuff in the middle
-                    with torch.no_grad():
-                        wandb_dict = metrics.pop()
-                        wandb_dict['time'] = timer.hit()
-                        wandb_dict['lr'] = self.opt.param_groups[0]['lr']
-                        timer.reset()
+                        wandb_dict['samples'] = to_wandb(
+                            batch.detach().contiguous().bfloat16(),
+                            ema_rec.detach().contiguous().bfloat16(),
+                            gather = False
+                        )
 
-                        if self.total_step_counter % self.train_cfg.sample_interval == 0:
-                            with ctx:
-                                sample_rgb, sample_depth = next(sample_loader)
+                    if self.rank == 0:
+                        wandb.log(wandb_dict)
 
-                                sample_rgb = sample_rgb[0].cuda().bfloat16() # n3hw
-                                sample_depth = sample_depth[0].cuda().bfloat16() # n1hw
-                                sample_input = torch.cat([sample_rgb, sample_depth], dim=1) # n4hw
-                                ema_rec = sampler(self.encoder, self.train_cfg.latent_scale, self.get_ema_core(), sample_input)
-                                # outputs are [n,c,h,w] on all devices
-                                if self.world_size > 1:
-                                    # Gather ema_rec across all devices to get [b, n, c, h, w]
-                                    ema_rec_list = [torch.zeros_like(ema_rec) for _ in range(self.world_size)]
-                                    torch.distributed.all_gather(ema_rec_list, ema_rec)
-                                    ema_rec = torch.stack(ema_rec_list, dim=0)
-                                    
-                                    # Also gather original RGB for side-by-side comparison
-                                    sample_rgb_list = [torch.zeros_like(sample_rgb) for _ in range(self.world_size)]
-                                    torch.distributed.all_gather(sample_rgb_list, sample_rgb.contiguous())
-                                    sample_rgb_gathered = torch.stack(sample_rgb_list, dim=0)
-                                else:
-                                    # For single device, add batch dimension to match ema_rec
-                                    sample_rgb_gathered = sample_rgb.unsqueeze(0)
-                                    ema_rec = ema_rec.unsqueeze(0)
-                            if self.rank == 0:
-                                wandb_dict['samples'] = to_wandb_video_sidebyside(
-                                    sample_rgb_gathered.detach().contiguous().bfloat16(),
-                                    ema_rec.detach().contiguous().bfloat16()
-                                )
+                self.total_step_counter += 1
+                if self.total_step_counter % self.train_cfg.save_interval == 0:
+                    if self.rank == 0:
+                        self.save()
 
-                        if self.rank == 0:
-                            wandb.log(wandb_dict)
-
-                    self.total_step_counter += 1
-                    if self.total_step_counter % self.train_cfg.save_interval == 0:
-                        if self.rank == 0:
-                            self.save()
-
-                    self.barrier()
+                self.barrier()

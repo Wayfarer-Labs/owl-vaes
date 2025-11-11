@@ -2,6 +2,13 @@ from .schedulers import get_sd3_euler
 import torch
 from tqdm import tqdm
 
+def get_sample_fn(name="simple"):
+    if name == "simple":
+        return flow_sample
+    elif name == "causal":
+        from .causdiffdec import causal_diffdec_sample
+        return causal_diffdec_sample
+
 @torch.no_grad()
 def flow_sample(model, dummy, z, steps, decoder=None, scaling_factor = 1.0, progress_bar = True, cfg_scale = 1.0):
     x = torch.randn_like(dummy)
