@@ -167,7 +167,7 @@ class VideoRoPEWithLatents(nn.Module):
             max_freq = min(n_p_y_rope, n_p_x_rope) * 0.8
         )
         freqs = rope_emb.get_axial_freqs(
-            n_frames
+            n_frames,
             n_p_y_rope,
             n_p_x_rope
         )
