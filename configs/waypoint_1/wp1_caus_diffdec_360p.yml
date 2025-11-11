@@ -7,10 +7,10 @@ model:
   patch_size: [5,2]
 
   n_layers: 24
-  n_heads: 24
+  n_heads: 16
   d_model: 1024
 
-  causal: false
+  causal: true
   mimetic_init: false
   block_size: null
   backbone: dit
@@ -18,6 +18,7 @@ model:
   dropout: 0.1
   shuffle_factor: 1
   cfg_prob: 0.1
+  n_frames: 2
 
 train:
   trainer_id: caus_diffdec_depth
@@ -26,6 +27,7 @@ train:
     source: 
      - /mnt/data/waypoint_1/data/MKIF/*/*.mp4
     target_size: [360, 640]
+    window_length: 2
 
   target_batch_size: 128
   batch_size: 16

@@ -186,9 +186,21 @@ class VideoRoPEWithLatents(nn.Module):
         x_video = x[:,:,:self.n_video]
         x_latent = x[:,:,self.n_video:]
 
+
         b,h,n,d = x_video.shape
-        x_video = x_video.view(b,h,self.n_frames,self.n_p_y,self.n_p_x,d)
-        x_latent = x_latent.view(b,h,self.n_frames, self.n_latent, self.n_latent, d)
+        x_video = eo.rearrange(
+            x_video,
+            'b h (n_frames n_p_y n_p_x) d -> b h n_frames n_p_y n_p_x d',
+            n_frames = self.n_frames,
+            n_p_y = self.n_p_y,
+        )
+        x_latent = eo.rearrange(
+            x_latent,
+            'b h (n_frames n_latent_1 n_latent_2) d -> b h n_frames n_latent_1 n_latent_2 d',
+            n_frames = self.n_frames,
+            n_latent_1 = self.n_latent,
+            n_latent_2 = self.n_latent,
+        )
 
         # "big video" where bottom right is latent
         pad_right = torch.zeros((b,h,self.n_frames,self.n_p_y,self.n_latent,d), dtype = x.dtype, device = x.device)
@@ -203,8 +215,17 @@ class VideoRoPEWithLatents(nn.Module):
         x_latent = x_video[:,:,:,self.n_p_y:,self.n_p_x:].contiguous()
         x_video = x_video[:,:,:,:self.n_p_y,:self.n_p_x].contiguous()
 
-        x_video = x_video.view(b,h,self.n_video,d)
-        x_latent = x_latent.view(b,h,self.n_latent**2,d)
+        x_video = eo.rearrange(
+            x_video,
+            'b h n_frames n_p_y n_p_x d -> b h (n_frames n_p_y n_p_x) d'
+        )
+        x_latent = eo.rearrange(
+            x_latent,
+            'b h n_frames n_latent_1 n_latent_2 d -> b h (n_frames n_latent_1 n_latent_2) d',
+            n_frames = self.n_frames,
+            n_latent_1 = self.n_latent,
+            n_latent_2 = self.n_latent,
+        )
         x = torch.cat([x_video, x_latent], dim = 2)
 
         return x

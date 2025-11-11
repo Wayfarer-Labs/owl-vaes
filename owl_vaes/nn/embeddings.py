@@ -5,6 +5,7 @@ from rotary_embedding_torch import (
     RotaryEmbedding,
     apply_rotary_emb
 )
+import einops as eo
 
 from .mlp import MLPSimple
 
@@ -85,7 +86,13 @@ class TimestepEmbedding(nn.Module):
             t = t.unsqueeze(0)
         # Remove assert for compilation compatibility
 
-        embs = self.sincos(t)
+        if t.ndim > 1: # [b,n]
+            b,n = t.shape
+            t_flat = eo.rearrange(t, 'b n -> (b n)')
+            embs = self.sincos(t_flat)
+            embs = eo.rearrange(embs, '(b n) d -> b n d', b = b, n = n)
+        else:
+            embs = self.sincos(t)
         return self.mlp(embs)
 
 class StepEmbedding(nn.Module):

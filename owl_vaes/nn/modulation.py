@@ -1,17 +1,10 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+import einops as eo
 
 from .normalization import LayerNorm
-
-def int_to_tuple(x):
-    if isinstance(x, int):
-        return (x,x)
-    elif isinstance(x, tuple) or isinstance(x, list):
-        return x
-    else:
-        try:
-            return tuple(x)
+from ..utils import int_to_tuple
 
 class _AdaLN(nn.Module):
     def __init__(self, config):
@@ -66,6 +59,8 @@ class VideoAdaLN(nn.Module):
             h = self.n_p_y,
             w = self.n_p_x
         )
+        if self.n_latent == 0:
+            return x_1
         x_2 = eo.repeat(
             x,
             'b n_frames d -> b (n_frames h w) d',
@@ -81,6 +76,7 @@ class VideoAdaLN(nn.Module):
         y = F.silu(cond)
         ab = self.fc(y) # [b,n_frames,2d]
         a,b = ab.chunk(2,dim=-1) # each [b,n_frames,d]
+
         a = self.broadcast_to_video_and_latent(a)
         b = self.broadcast_to_video_and_latent(b)
 
@@ -88,7 +84,7 @@ class VideoAdaLN(nn.Module):
         return x
 
 def AdaLN(config):
-    if hasattr(config, 'n_frames') and config.n_frames > 1 and config.causal:
+    if hasattr(config, 'n_frames') and config.n_frames > 1:
         return VideoAdaLN(config)
     else:
         return _AdaLN(config)
@@ -152,8 +148,8 @@ class VideoGate(nn.Module):
         c = self.broadcast_to_video_and_latent(c)
         return c * x
 
-class Gate(config):
-    if hasattr(config, 'n_frames') and config.n_frames > 1 and config.causal:
+def Gate(config):
+    if hasattr(config, 'n_frames') and config.n_frames > 1:
         return VideoGate(config)
     else:
         return _Gate(config)

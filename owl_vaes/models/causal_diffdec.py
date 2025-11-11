@@ -108,6 +108,7 @@ class DiffusionDecoderCore(nn.Module):
 
         x = self.proj_in(x) # -> [b,n,d]
         z = self.proj_in_z(z)
+
         
         n = x.shape[1]
         x = torch.cat([x,z],dim=1)
@@ -188,20 +189,14 @@ if __name__ == "__main__":
     import torch
     import torch.nn.functional as F
 
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    device = 'cuda'
 
-    cfg = Config.from_yaml("configs/waypoint_1/wp1_diffdec.yml").model
+    cfg = Config.from_yaml("configs/waypoint_1/wp1_caus_diffdec_360p.yml").model
 
-    from diffusers import AutoencoderTiny
-    vae = AutoencoderTiny.from_pretrained("madebyollin/taef1")
-    vae = vae.float().to(device)  # bfloat16 not supported on mps
-
-    model = DiffusionDecoderCore(cfg).float().to(device)
-    x = torch.randn(1,3,720,1280).float().to(device)
-    z = torch.randn(1,64,16,16).float().to(device)
+    model = CausalDiffusionDecoder(cfg).float().to(device)
+    x = torch.randn(1,2,16,45,80).float().to(device)
+    z = torch.randn(1,2,64,16,16).float().to(device)
 
     with torch.no_grad():
-        proxy = vae.encoder(x)
-        y = model(proxy, z, torch.tensor([0.5]).to(device).float())
-        rec = vae.decoder(y)
-        print(rec.shape)
+        diff_loss = model(x, z)
+        print(diff_loss)

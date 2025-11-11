@@ -2,15 +2,17 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .attn import Attn
+from .attn import Attn, CausalAttn
 from .mlp import MLP
 from .modulation import AdaLN, Gate
+
+from copy import deepcopy
 
 class DiTBlock(nn.Module):
     def __init__(self, config : 'TransformerConfig'):
         super().__init__()
 
-        self.attn = Attn(config)
+        self.attn = Attn(config) if not config.causal else CausalAttn(config)
         self.mlp = MLP(config)
 
         self.adaln1 = AdaLN(config)
@@ -18,14 +20,14 @@ class DiTBlock(nn.Module):
         self.gate1 = Gate(config)
         self.gate2 = Gate(config)
 
-    def forward(self, x, cond):
+    def forward(self, x, cond, attn_mask = None):
         # x is [b,n,d]
         # cond is [b,d]
 
         # First block
         res1 = x.clone()
         x = self.adaln1(x, cond)
-        x = self.attn(x)
+        x = self.attn(x, attn_mask)
         x = self.gate1(x, cond)
         x = res1 + x
 
@@ -45,6 +47,9 @@ class FinalLayer(nn.Module):
         channels = config.channels
         d_model = config.d_model
         patch_size = config.patch_size
+
+        config = deepcopy(config)
+        config.latent_size = 0
 
         self.norm = AdaLN(config)
         self.act = nn.SiLU()
@@ -69,8 +74,8 @@ class DiT(nn.Module):
         self.config = config
         self.n_latents = config.latent_size**2
 
-    def forward(self, x, cond):
+    def forward(self, x, cond, attn_mask = None):
         for i, block in enumerate(self.blocks):
-            x = block(x, cond)
+            x = block(x, cond, attn_mask)
 
         return x

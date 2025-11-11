@@ -2,7 +2,8 @@ import einops as eo
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.nn.attention.flex_attention import flex_attention
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+import einops as eo
 
 from owl_vaes.configs import TransformerConfig
 
@@ -23,8 +24,8 @@ def get_attn_mask(
     cache_frame_offset = 0,
     batch_size = None,
     device = None,
-    max_q_len = None,
-    max_kv_len = None
+    max_q_len = 1024,
+    max_kv_len = 1024
 ):
     """
     This will assume combined latents
@@ -46,32 +47,37 @@ def get_attn_mask(
         return idx < n_video
 
     def frame_idx(idx):
-        if is_video(idx):
-            return idx // (n_p_y * n_p_x) # Which frame we're on
-        else:
-            shift_idx = idx - n_video
-            return shift_idx // (config.latent_size ** 2)
+        video_result = idx // (n_p_y * n_p_x)
+        shift_idx = idx - n_video
+        latent_result = shift_idx // (config.latent_size ** 2)
+        return torch.where(is_video(idx), video_result, latent_result)
         
     def row_idx(idx):
-        if is_latent(idx):
-            shift_idx = idx - n_video
-            in_frame_idx = shift_idx % (config.latent_size ** 2)
-            return in_frame_idx // config.latent_size
-        else:
-            in_frame_idx = idx % (n_p_y * n_p_x)
-            return in_frame_idx // n_p_x
+        # Latent case
+        shift_idx = idx - n_video
+        in_frame_idx_latent = shift_idx % (config.latent_size ** 2)
+        latent_result = in_frame_idx_latent // config.latent_size
+
+        # Video case
+        in_frame_idx_video = idx % (n_p_y * n_p_x)
+        video_result = in_frame_idx_video // n_p_x
+
+        return torch.where(is_latent(idx), latent_result, video_result)
     
     def col_idx(idx):
-        if is_latent(idx):
-            shift_idx = idx - n_video
-            in_frame_idx = shift_idx % (config.latent_size ** 2)
-            return in_frame_idx % config.latent_size
-        else:
-            in_frame_idx = idx % (n_p_y * n_p_x)
-            return in_frame_idx % n_p_x
+        # Latent case
+        shift_idx = idx - n_video
+        in_frame_idx_latent = shift_idx % (config.latent_size ** 2)
+        latent_result = in_frame_idx_latent % config.latent_size
+
+        # Video case
+        in_frame_idx_video = idx % (n_p_y * n_p_x)
+        video_result = in_frame_idx_video % n_p_x
+
+        return torch.where(is_latent(idx), latent_result, video_result)
         
-    def can_attend_to(idx_i, idx_j):
-        frame_idx_i = frame_idx(idx_i) + cache_frame_offset
+    def can_attend_to(b,h,idx_i, idx_j):
+        frame_idx_i = frame_idx(idx_i)
         row_idx_i = row_idx(idx_i)
         col_idx_i = col_idx(idx_i)
 
@@ -90,6 +96,7 @@ def get_attn_mask(
         device=device,
     )
 
+# TODO: Delete this and use the other as a default
 class Attn(nn.Module):
     def __init__(self, config : TransformerConfig):
         super().__init__()
@@ -113,15 +120,10 @@ class Attn(nn.Module):
 
     def forward(self, x, kv_cache = None, attn_mask = None):
         # x: [b, n, d_model]
-        b, n, d_model = x.shape
-        h = self.n_heads
-        d = d_model // h
 
         # Linear projection and split into q, k, v
         qkv = self.qkv(x)  # [b, n, 3 * d_model]
-        qkv = qkv.view(b, n, 3, h, d)  # [b, n, 3, h, d]
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, b, h, n, d]
-        q, k, v = qkv[0], qkv[1], qkv[2]  # each [b, h, n, d]
+        q,k,v = eo.rearrange(qkv, 'b n (three h d) -> three b h n d', h = self.n_heads, three = 3)
 
         q, k = self.qk_norm(q, k)
         if self.rope is not None:
@@ -130,8 +132,7 @@ class Attn(nn.Module):
         #x_out = flex_attention(q,k,v)
         x_out = x_out.to(x.dtype)
 
-        # Rearrange from [b, h, n, d] -> [b, n, h * d]
-        x_out = x_out.permute(0, 2, 1, 3).contiguous().view(b, n, h * d)
+        x_out = eo.rearrange(x_out, 'b h n d -> b n (h d)')
         x_out = self.out(x_out)
         return x_out
 
@@ -151,26 +152,26 @@ class CausalAttn(nn.Module):
         self.rope = get_rope_impl("video+latent")(config)
 
         self.layer_ind = None
-        self.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.weight)
     
     def forward(self, x, kv_cache = None, attn_mask = None):
         # x: [b, n, d_model]
-        b, n, d_model = x.shape
-        h = self.n_heads
-        d = d_model // h
 
         # Linear projection and split into q, k, v
         qkv = self.qkv(x)  # [b, n, 3 * d_model]
-        qkv = qkv.view(b, n, 3, h, d)  # [b, n, 3, h, d]
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, b, h, n, d]
-        q, k, v = qkv[0], qkv[1], qkv[2]  # each [b, h, n, d]
+        q,k,v = eo.rearrange(qkv, 'b n (three h d) -> three b h n d', h = self.n_heads, three = 3)
 
         q, k = self.qk_norm(q, k)
         if self.rope is not None:
             q, k = self.rope(q, k)
 
         x_out = flex_attention(q,k,v,block_mask=attn_mask)
-        
+        x_out = x_out.to(x.dtype)
+
+        x_out = eo.rearrange(x_out, 'b h n d -> b n (h d)')
+        x_out = self.out(x_out)
+        return x_out
+
 class Transformer(nn.Module):
     def __init__(self, config):
         super().__init__()

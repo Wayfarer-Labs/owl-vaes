@@ -23,6 +23,13 @@ from .base import BaseTrainer
 from ..configs import Config
 from ..sampling.causdiffdec import causal_diffdec_sample
 
+def video_interpolate(x, *args, **kwargs):
+    b,n = x.shape[:2]
+    x = eo.rearrange(x, 'b n ... -> (b n) ...')
+    x = F.interpolate(x, *args, **kwargs)
+    x = eo.rearrange(x, '(b n) ... -> b n ...', b = b, n = n)
+    return x
+
 class VideoDiffDecLiveDepthTrainer(BaseTrainer):
     """
     Trainer for causal diffusion decoder with proxy VAE + depth encoder
@@ -162,6 +169,8 @@ class VideoDiffDecLiveDepthTrainer(BaseTrainer):
         def teacher_sample(batch):
             b,n = batch.shape[:2]
             batch = eo.rearrange(batch, 'b n ... -> (b n) ...')
+            #print(batch.shape)
+            #exit()
             batch = F.interpolate(batch, (360, 640), mode='bilinear', align_corners=False)
             batch_depth = self.depth(batch).unsqueeze(1)
             batch = torch.cat([batch, batch_depth], dim = 1)
