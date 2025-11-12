@@ -1,12 +1,13 @@
 model:
   model_id: causal_diffdec
-  sample_size: [45, 80]
-  channels: 16
+  sample_size: [360, 640]
+  channels: 3
   latent_size: 16
   latent_channels: 64
-  patch_size: [5,2]
+  patch_size: [20,20]
+  kernel: null
 
-  n_layers: 24
+  n_layers: 16
   n_heads: 16
   d_model: 1024
 
@@ -28,9 +29,15 @@ train:
      - /mnt/data/waypoint_1/data/MKIF/*/*.mp4
     target_size: [360, 640]
     window_length: 2
+  eval_data_id: video_dir_loader
+  eval_data_kwargs:
+    source: 
+     - /mnt/data/waypoint_1/data/MKIF/*/*.mp4
+    target_size: [360, 640]
+    window_length: 16 
 
-  target_batch_size: 128
-  batch_size: 16
+  target_batch_size: 16
+  batch_size: 2
 
   epochs: 200
 
@@ -75,6 +82,7 @@ train:
   ldm_scale: 1.0
   sampling_steps: 20
   cfg_scale: 1.5
+  use_proxy: false
 
 wandb:
   name: shahbuland
