@@ -2,6 +2,7 @@ from .schedulers import get_sd3_euler
 import torch
 from tqdm import tqdm
 import einops as eo
+from ..nn.attn import get_attn_mask
 
 def zlerp(x, t):
     eps = torch.randn_like(x)
@@ -22,6 +23,19 @@ def causal_diffdec_sample(
 ):
     window_size = model.n_frames
 
+    max_q = model.config.latent_size ** 2 * model.config.n_frames
+    max_q += model.n_p_y * model.n_p_x * model.config.n_frames
+    max_kv = max_q
+
+    attn_mask = get_attn_mask(
+        model.config,
+        batch_size = 1,
+        device = z.device,
+        max_q_len = max_q,
+        max_kv_len = max_kv,
+        kernel_size = (4,4)
+    )
+
     generated_frames = []
     context = gt_frames[:,:window_size]
     ts_start = torch.ones_like(context[:,:,0,0,0]) * prev_noise
@@ -41,14 +55,15 @@ def causal_diffdec_sample(
         context_z = z[:,frame_idx:frame_idx+window_size].clone()
 
         for i in range(steps):
-            pred = model(noisy_video, context_z, ts)
+            pred = model(noisy_video, context_z, ts, attn_mask = attn_mask)
             pred_uncond = model(noisy_video, null_emb, ts)
             pred = pred_uncond + cfg_scale * (pred - pred_uncond)
             noisy_video[:,-1] = noisy_video[:,-1] - dt_list[i] * pred[:,:-1]
             ts[:,-1] = ts[:,-1] - dt_list[i]
         
         generated_frames.append(noisy_video[:,-1])
-        context = torch.cat([context[:,1:], noisy_video[:,-1]], dim = 1)
+
+        context = torch.cat([context[:,1:], noisy_video[:,-1:]], dim = 1)
     
     x = torch.stack(generated_frames, dim = 1)
     if decoder is not None:
@@ -59,3 +74,19 @@ def causal_diffdec_sample(
         x = eo.rearrange(x, '(b n) c h w -> b n c h w', b = b, n = n)
         x = x.clamp(-1,1)
     return x
+
+if __name__ == "__main__":
+    from ..models.causal_diffdec import CausalDiffusionDecoder
+    from ..configs import Config
+    import torch
+
+    cfg_path = "configs/waypoint_1/wp1_caus_diffdec_360p.yml"
+    cfg = Config.from_yaml(cfg_path).model
+    model = CausalDiffusionDecoder(cfg).core
+    model = model.cuda().bfloat16()
+
+    gt_frames = torch.randn(1,32,3,720,1280).cuda().bfloat16()
+    z = torch.randn(1,32,128,8,8).cuda().bfloat16()
+
+    samples = causal_diffdec_sample(model, gt_frames, z, 4, decoder = None)
+    print(samples.shape)

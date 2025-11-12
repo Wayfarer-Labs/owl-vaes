@@ -25,13 +25,17 @@ def get_attn_mask(
     batch_size = None,
     device = None,
     max_q_len = 1024,
-    max_kv_len = 1024
+    max_kv_len = 1024,
+    kernel_size = None,
 ):
     """
     This will assume combined latents
     """
     h,w = int_to_tuple(config.sample_size)
     p_y, p_x = int_to_tuple(config.patch_size)
+    if kernel_size is not None:
+        k_y, k_x = int_to_tuple(kernel_size)
+
     n_frames = config.n_frames
     n_p_y = h // p_y
     n_p_x = w // p_x
@@ -85,7 +89,25 @@ def get_attn_mask(
         row_idx_j = row_idx(idx_j)
         col_idx_j = col_idx(idx_j)
 
-        return frame_idx_j <= frame_idx_i
+        if kernel_size is None:
+            return frame_idx_j <= frame_idx_i
+        else:
+            causal_mask = (frame_idx_j <= frame_idx_i)
+
+            # If i is image, it can attend to images in neighbourhood
+            image_nbr_mask = (torch.abs(row_idx_j - row_idx_i) <= k_y) & (torch.abs(col_idx_j - col_idx_i) <= k_x)
+            
+            # If i is latent, it can attend to any other latent in its frame
+            # It can't attend to any image tokens
+            # If i is image, it can attend to any latent tokens or image tokens in neighbourhood
+            nbr_mask = torch.where(
+                is_latent(idx_i),
+                is_latent(idx_j),
+                is_latent(idx_j) | image_nbr_mask
+            )
+
+            return causal_mask & nbr_mask
+
     
     return create_block_mask(
         can_attend_to,

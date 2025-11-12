@@ -182,6 +182,8 @@ class VideoRoPEWithLatents(nn.Module):
         self.n_video = n_frames * self.n_images
 
     def apply(self, x):
+        orig_dtype = x.dtype
+
         # x is bhnd
         x_video = x[:,:,:self.n_video]
         x_latent = x[:,:,self.n_video:]
@@ -228,7 +230,7 @@ class VideoRoPEWithLatents(nn.Module):
         )
         x = torch.cat([x_video, x_latent], dim = 2)
 
-        return x
+        return x.to(orig_dtype)
     
     def forward(self, q, k):
         q = self.apply(q)

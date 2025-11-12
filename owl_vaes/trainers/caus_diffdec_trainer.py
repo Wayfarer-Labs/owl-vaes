@@ -201,7 +201,6 @@ class VideoDiffDecLiveDepthTrainer(BaseTrainer):
                         proxy_z = proxy_encode(batch)
                         
                     diff_loss = self.model(proxy_z, teacher_z)
-                    diff_loss = diff_loss
 
                 metrics.log('diff_loss', diff_loss)
                 total_loss += diff_loss
