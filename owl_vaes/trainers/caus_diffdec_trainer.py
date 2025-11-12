@@ -18,7 +18,7 @@ from ..muon import init_muon
 from ..nn.lpips import get_lpips_cls
 from ..schedulers import get_scheduler_cls
 from ..utils import Timer, freeze, unfreeze, versatile_load
-from ..utils.logging import LogHelper, to_wandb, to_wandb_grayscale
+from ..utils.logging import LogHelper, to_wandb_video_sidebyside
 from .base import BaseTrainer
 from ..configs import Config
 from ..sampling.causdiffdec import causal_diffdec_sample
@@ -78,7 +78,7 @@ class VideoDiffDecLiveDepthTrainer(BaseTrainer):
         self.depth = FlashDepthModel(
             model_size='vits',
             use_mamba=False,
-            checkpoint_path='FlashDepth/configs/flashdepth/iter_43002.pth'
+            checkpoint_path='FlashDepth/configs/flashdepth/iter_43002.pth',
         )
 
         # TAEF1
@@ -126,7 +126,7 @@ class VideoDiffDecLiveDepthTrainer(BaseTrainer):
         # Depth prep
         freeze(self.depth)
         self.depth = self.depth.to(self.device).bfloat16()
-        self.depth = torch.compile(self.depth)
+        self.depth.compile()
 
         # TAEF1 prep
         freeze(self.proxy)
@@ -164,6 +164,8 @@ class VideoDiffDecLiveDepthTrainer(BaseTrainer):
 
         # Dataset setup
         loader = get_loader(self.train_cfg.data_id, self.train_cfg.batch_size, **self.train_cfg.data_kwargs)
+        eval_loader = get_loader(self.train_cfg.eval_data_id, self.train_cfg.batch_size, **self.train_cfg.eval_data_kwargs)
+        eval_loader = iter(eval_loader)
 
         @torch.no_grad()
         def teacher_sample(batch):
@@ -180,6 +182,12 @@ class VideoDiffDecLiveDepthTrainer(BaseTrainer):
             teacher_z = teacher_z / self.train_cfg.latent_scale
             teacher_z = eo.rearrange(teacher_z, '(b n) ... -> b n ...', b = b, n = n)
             return teacher_z
+
+        @torch.no_grad()
+        def teacher_sample_eval(batch):
+            batch_splits = batch.split(self.model_cfg.n_frames, dim = 1)
+            batch_splits = [teacher_sample(batch_split) for batch_split in batch_splits]
+            return torch.cat(batch_splits, dim = 1)
         
         @torch.no_grad()
         def proxy_encode(batch):
@@ -198,7 +206,10 @@ class VideoDiffDecLiveDepthTrainer(BaseTrainer):
                 with ctx:
                     with torch.no_grad():
                         teacher_z = teacher_sample(batch)
-                        proxy_z = proxy_encode(batch)
+                        if self.train_cfg.use_proxy:
+                            proxy_z = proxy_encode(batch)
+                        else:
+                            proxy_z = batch
                         
                     diff_loss = self.model(proxy_z, teacher_z)
 
@@ -225,21 +236,29 @@ class VideoDiffDecLiveDepthTrainer(BaseTrainer):
 
                     if self.total_step_counter % self.train_cfg.sample_interval == 0:
                         with ctx:
-                            cfg_scale = getattr(self.train_cfg, 'cfg_scale', 1.0)
+                            batch = next(eval_loader)
+                            batch = batch.to(self.device).bfloat16()
+                            teacher_z = teacher_sample_eval(batch)
+                            if self.train_cfg.use_proxy:
+                                proxy_z = proxy_encode(batch)
+                            else:
+                                proxy_z = batch
+                            
+                            cfg_scale = getattr(self.train_cfg, 'cfg_scale', 1.5)
                             ema_rec = causal_diffdec_sample(
                                 self.get_ema_core(),
                                 proxy_z,
                                 teacher_z,
                                 self.train_cfg.sampling_steps,
-                                self.proxy.decoder,
+                                decoder = None,
                                 scaling_factor = self.train_cfg.ldm_scale,
                                 cfg_scale = cfg_scale
                             )
+                            batch = batch[:,(self.model_cfg.n_frames-1):,:3]
 
-                        wandb_dict['samples'] = to_wandb(
+                        wandb_dict['samples'] = to_wandb_video_sidebyside(
                             batch.detach().contiguous().bfloat16(),
-                            ema_rec.detach().contiguous().bfloat16(),
-                            gather = False
+                            ema_rec.detach().contiguous().bfloat16()
                         )
 
                     if self.rank == 0:

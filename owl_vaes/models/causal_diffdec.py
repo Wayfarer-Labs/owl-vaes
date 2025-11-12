@@ -6,7 +6,7 @@ import math
 from copy import deepcopy
 import einops as eo
 
-from ..utils import freeze
+from ..utils import freeze, int_to_tuple
 from ..configs import TransformerConfig
 from ..nn.resnet import SquareToLandscape, LandscapeToSquare
 
@@ -83,10 +83,16 @@ class DiffusionDecoderCore(nn.Module):
         # ts is [b,n] in [0,1] - per-frame timesteps
 
         if attn_mask is None:
+            max_q = self.n_p_y * self.n_p_x * self.n_frames
+            max_q += self.config.latent_size ** 2 * self.n_frames
+            max_kv = max_q
             attn_mask = get_attn_mask(
                 self.config,
                 batch_size = x.shape[0],
-                device = x.device
+                device = x.device,
+                max_q_len = max_q,
+                max_kv_len = max_kv,
+                kernel_size = int_to_tuple(getattr(self.config, "kernel", None))
             )
 
         if self.shuffle_factor > 1:

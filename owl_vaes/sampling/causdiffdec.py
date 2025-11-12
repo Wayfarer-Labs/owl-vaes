@@ -3,6 +3,7 @@ import torch
 from tqdm import tqdm
 import einops as eo
 from ..nn.attn import get_attn_mask
+from ..utils import int_to_tuple
 
 def zlerp(x, t):
     eps = torch.randn_like(x)
@@ -33,7 +34,7 @@ def causal_diffdec_sample(
         device = z.device,
         max_q_len = max_q,
         max_kv_len = max_kv,
-        kernel_size = (4,4)
+        kernel_size = int_to_tuple(getattr(model.config, "kernel", None)) 
     )
 
     generated_frames = []
@@ -47,31 +48,39 @@ def causal_diffdec_sample(
     frames_to_generate = z.shape[1] - window_size + 1
     for frame_idx in tqdm(range(frames_to_generate), disable = not progress_bar):
         # Context video with noise as last frame
+
         noisy_video = context.clone()
         noisy_video[:,:-1] = zlerp(noisy_video[:,:-1], prev_noise)
         noisy_video[:,-1] = torch.randn_like(noisy_video[:,-1])
         ts = ts_start.clone()
 
-        context_z = z[:,frame_idx:frame_idx+window_size].clone()
+        context_z = z[:,frame_idx:frame_idx+window_size].clone().contiguous()
+        noisy_video = noisy_video.contiguous()
+        ts = ts.contiguous()
+        null_emb = null_emb.contiguous()
 
         for i in range(steps):
+
             pred = model(noisy_video, context_z, ts, attn_mask = attn_mask)
-            pred_uncond = model(noisy_video, null_emb, ts)
+            pred_uncond = model(noisy_video, null_emb, ts, attn_mask = attn_mask)
             pred = pred_uncond + cfg_scale * (pred - pred_uncond)
-            noisy_video[:,-1] = noisy_video[:,-1] - dt_list[i] * pred[:,:-1]
+            noisy_video[:,-1] = noisy_video[:,-1] - dt_list[i] * pred[:,-1]
             ts[:,-1] = ts[:,-1] - dt_list[i]
         
         generated_frames.append(noisy_video[:,-1])
-
         context = torch.cat([context[:,1:], noisy_video[:,-1:]], dim = 1)
     
     x = torch.stack(generated_frames, dim = 1)
     if decoder is not None:
         x = x.bfloat16() * scaling_factor
         b,n = x.shape[:2]
-        x = eo.rearrange(x, 'b n c h w -> (b n) c h w')
-        x = decoder(x)
-        x = eo.rearrange(x, '(b n) c h w -> b n c h w', b = b, n = n)
+        # For loop over n, passing b c h w each time and stacking results
+        frames = []
+        for i in range(n):
+            xi = x[:, i]  # [b, c, h, w]
+            xi_dec = decoder(xi)
+            frames.append(xi_dec)
+        x = torch.stack(frames, dim=1)  # [b, n, c, h, w]
         x = x.clamp(-1,1)
     return x
 
@@ -84,9 +93,14 @@ if __name__ == "__main__":
     cfg = Config.from_yaml(cfg_path).model
     model = CausalDiffusionDecoder(cfg).core
     model = model.cuda().bfloat16()
+    #model = torch.compile(model)
 
-    gt_frames = torch.randn(1,32,3,720,1280).cuda().bfloat16()
-    z = torch.randn(1,32,128,8,8).cuda().bfloat16()
+    N_FRAMES = 128
+    BATCH_SIZE = 1
 
-    samples = causal_diffdec_sample(model, gt_frames, z, 4, decoder = None)
+    with torch.inference_mode():
+        gt_frames = torch.randn(BATCH_SIZE,N_FRAMES,3,720,1280).cuda().bfloat16()
+        z = torch.randn(BATCH_SIZE,N_FRAMES,128,8,8).cuda().bfloat16()
+
+        samples = causal_diffdec_sample(model, gt_frames, z, 4, decoder = None)
     print(samples.shape)

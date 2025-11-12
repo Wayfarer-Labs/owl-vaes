@@ -64,7 +64,9 @@ def find_unused_params(model):
             print(f"Parameter with no gradient: {name}")
 
 def int_to_tuple(x):
-    if isinstance(x, int):
+    if x is None:
+        return None
+    elif isinstance(x, int):
         return (x,x)
     elif isinstance(x, tuple) or isinstance(x, list):
         return x
