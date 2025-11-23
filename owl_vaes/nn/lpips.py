@@ -71,6 +71,8 @@ def landscape_patchify_720p(x):
 
 def landscape_patchify(x):
     _, _, h, w = x.shape
+    if h == 180 and w == 320:
+        return landscape_patchify_360p(x)
     if h == 360 and w == 640:
         return landscape_patchify_360p(x)
     elif h == 720 and w == 1280:

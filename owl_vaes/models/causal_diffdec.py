@@ -40,7 +40,7 @@ def vid_pixel_unshuffle(x, shuffle_factor):
     x = eo.rearrange(x, '(b n) ... -> b n ...', n = n)
     return x
 
-class DiffusionDecoderCore(nn.Module):
+class CausalDiffusionDecoderCore(nn.Module):
     def __init__(self, config : TransformerConfig):
         super().__init__()
 
@@ -57,10 +57,6 @@ class DiffusionDecoderCore(nn.Module):
         self.ts_embed = TimestepEmbedding(config.d_model)
         
         self.proj_in_z = nn.Linear(config.latent_channels, config.d_model)
-
-        self.rope_impl = getattr(config, "rope_impl", None)
-        if self.rope_impl is None:
-            raise ValueError("rope_impl must be set; learned positional encodings are no longer supported.")
 
         self.final = FinalLayer(config, skip_proj = True)
 
@@ -143,7 +139,7 @@ class CausalDiffusionDecoder(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.core = DiffusionDecoderCore(config)
+        self.core = CausalDiffusionDecoderCore(config)
 
         self.ts_mu = 0.0
         self.ts_sigma = 1.0

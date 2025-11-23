@@ -4,6 +4,9 @@ def get_model_cls(model_id: str) -> Any:
     if model_id == "dcae":
         from .dcae import DCAE
         return DCAE
+    if model_id == "dcae_transformer":
+        from .dcae_transformer import DCAETransformer
+        return DCAETransformer
     if model_id == "titok":
         from .titok import TiToKVAE
         return TiToKVAE

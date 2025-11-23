@@ -51,6 +51,9 @@ def get_trainer_cls(trainer_id: Literal["rec", "proxy", "audio_rec"]):
         case "distill_depth_enc":
             from .distill_depth_enc import DistillDepthEncTrainer
             return DistillDepthEncTrainer
+        case "distill_pretrained_enc":
+            from .distill_pretrained_enc import DistillPretrainedEncTrainer
+            return DistillPretrainedEncTrainer
         case "distill_dec_depth":
             from .distill_dec_live_depth import DistillDecLiveDepthTrainer
             return DistillDecLiveDepthTrainer

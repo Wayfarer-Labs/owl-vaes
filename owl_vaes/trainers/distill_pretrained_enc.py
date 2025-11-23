@@ -1,5 +1,5 @@
 """
-Trainer for distilling encoder with simplified loss, with live depth generation
+Trainer for distilling pretrained diffusers encoder with simplified loss
 """
 
 import torch
@@ -20,9 +20,11 @@ from ..utils.logging import LogHelper, to_wandb, to_wandb_grayscale
 from .base import BaseTrainer
 from ..configs import Config
 
-class DistillDepthEncTrainer(BaseTrainer):
+from diffusers import AutoModel
+
+class DistillPretrainedEncTrainer(BaseTrainer):
     """
-    Trainer for distilling the encoder with live depth generation, with frozen decoder.
+    Trainer for distilling the pretrained diffusers encoder, with frozen decoder.
     Does L1/L2 regression on latents
 
     :param train_cfg: Configuration for training
@@ -36,13 +38,7 @@ class DistillDepthEncTrainer(BaseTrainer):
         super().__init__(*args,**kwargs)
 
         teacher_ckpt_path = self.train_cfg.teacher_ckpt
-        teacher_cfg_path = self.train_cfg.teacher_cfg
-
-        teacher_ckpt = versatile_load(teacher_ckpt_path)
-        teacher_cfg = Config.from_yaml(teacher_cfg_path).model
-
-        teacher = get_model_cls(teacher_cfg.model_id)(teacher_cfg)
-        teacher.load_state_dict(teacher_ckpt)
+        teacher = AutoModel.from_pretrained(teacher_ckpt_path)
 
         self.teacher_encoder = teacher.encoder
         self.teacher_decoder = teacher.decoder
@@ -63,15 +59,7 @@ class DistillDepthEncTrainer(BaseTrainer):
         self.ema = None
 
         self.model_input_size = [int(self.model_cfg.sample_size[0]), int(self.model_cfg.sample_size[1])]
-
-        import sys
-        sys.path.append("./FlashDepth")
-        from flashdepth import FlashDepthModel
-        self.depth = FlashDepthModel(
-            model_size='vits',
-            use_mamba=False,
-            checkpoint_path='FlashDepth/configs/flashdepth/iter_43002.pth'
-        )
+        self.teacher_input_size = getattr(self.train_cfg, 'teacher_input_size', [512, 512])
 
     def save(self):
         save_dict = {
@@ -105,7 +93,6 @@ class DistillDepthEncTrainer(BaseTrainer):
         # Loss weights
         l1_weight = self.train_cfg.loss_weights.get('l1', 0.0)
         l2_weight = self.train_cfg.loss_weights.get('l2', 1.0)
-        logvar_weight = self.train_cfg.loss_weights.get('logvar', 0.0)
 
         # Prepare model
         self.model = self.model.to(self.device).train()
@@ -120,16 +107,9 @@ class DistillDepthEncTrainer(BaseTrainer):
         freeze(self.teacher_decoder)
         self.teacher_decoder = torch.compile(self.teacher_decoder)#, mode='max-autotune', dynamic=False, fullgraph=True)
 
-        # Depth prep
-        self.depth = self.depth.to(self.device).bfloat16()
-        self.depth = torch.compile(self.depth)
-
-        lpips = get_lpips_cls(self.train_cfg.lpips_type)(self.device).to(self.device).eval()
-        freeze(lpips)
-
         self.ema = EMA(
             self.model,
-            beta = 0.9999,
+            beta = 0.999,
             update_after_step = 0,
             update_every = 1
         )
@@ -193,43 +173,20 @@ class DistillDepthEncTrainer(BaseTrainer):
         for _ in range(self.train_cfg.epochs):
             for batch in loader:
                 total_loss = 0.
-                batch = batch.to(self.device).bfloat16()
-                with torch.no_grad():
-                    depth = self.depth(batch).unsqueeze(1)
+                full_batch = batch.to(self.device).bfloat16()
 
-                batch = torch.cat([batch, depth], dim = 1)
-                full_batch = batch.clone()
-                batch = F.interpolate(batch, self.model_input_size, mode='bilinear', align_corners=False)
+                batch = F.interpolate(full_batch, self.model_input_size, mode='bilinear', align_corners=False)
+                teacher_batch = F.interpolate(full_batch, self.teacher_input_size, mode='bilinear', align_corners=False)
 
                 with ctx:
                     with torch.no_grad():
-                        teacher_output = self.teacher_encoder(batch)
-                        skip_logvar = getattr(self.model_cfg, 'skip_logvar', False)
-
-                        if skip_logvar:
-                            teacher_mu = teacher_output
-                            teacher_logvar = None
-                        else:
-                            teacher_mu, teacher_logvar = teacher_output
-
+                        teacher_mu = self.teacher_encoder(teacher_batch)
                         target_mu = divide_latent_scale(teacher_mu)
-                        if teacher_logvar is not None:
-                            target_logvar = divide_latent_scale(teacher_logvar)
-                        else:
-                            target_logvar = None
 
                     target_mu = target_mu.bfloat16()
-                    if target_logvar is not None:
-                        target_logvar = target_logvar.bfloat16()
 
-                    # Get student encoder output (mu, logvar if not skip_logvar)
-                    student_output = self.model(batch)
-
-                    if skip_logvar:
-                        student_mu = student_output
-                        student_logvar = None
-                    else:
-                        student_mu, student_logvar = student_output
+                    # Get student encoder output
+                    student_mu = self.model(batch)
 
                     # Loss computation
                     if l2_weight > 0.0:
@@ -242,17 +199,11 @@ class DistillDepthEncTrainer(BaseTrainer):
                         total_loss += l1_loss * l1_weight
                         metrics.log('l1_loss', l1_loss)
 
-                    if logvar_weight > 0.0 and student_logvar is not None and target_logvar is not None:
-                        logvar_loss = F.mse_loss(student_logvar, target_logvar) / accum_steps
-                        total_loss += logvar_loss * logvar_weight
-                        metrics.log('logvar_loss', logvar_loss)
-
                     self.scaler.scale(total_loss).backward()
 
                 local_step += 1
                 if local_step % accum_steps == 0:
-                    if self.ema is not None:
-                        self.ema.update()
+                    self.ema.update()
 
                     # Updates
                     if self.train_cfg.opt.lower() != "muon":
@@ -274,21 +225,10 @@ class DistillDepthEncTrainer(BaseTrainer):
                         wandb_dict['lr'] = self.opt.param_groups[0]['lr']
                         timer.reset()
 
-                        student_z = student_mu.clone()
-
                         if self.total_step_counter % self.train_cfg.sample_interval == 0:
                             with ctx:
-                                teacher_output = self.teacher_encoder(full_batch)
-                                if skip_logvar:
-                                    teacher_latent = teacher_output.clone()
-                                else:
-                                    teacher_latent = teacher_output[0].clone()  # Use mu
-
-                                student_output = self.ema.ema_model(full_batch)
-                                if skip_logvar:
-                                    student_latent = student_output.clone()
-                                else:
-                                    student_latent = student_output[0].clone()  # Use mu
+                                teacher_latent = self.teacher_encoder(teacher_batch).clone()
+                                student_latent = self.ema.ema_model(batch).clone()
 
                                 student_latent = multiply_latent_scale(student_latent)
 
@@ -300,14 +240,6 @@ class DistillDepthEncTrainer(BaseTrainer):
                                 student_rec[:,:3].detach().contiguous().bfloat16(),
                                 gather = False
                             )
-
-                            # Log depth maps
-                            depth_samples = to_wandb_grayscale(
-                                teacher_rec[:,3].unsqueeze(1).detach().contiguous().bfloat16(),
-                                student_rec[:,3].unsqueeze(1).detach().contiguous().bfloat16(),
-                                gather = False
-                            )
-                            wandb_dict['depth_samples'] = depth_samples
 
                         if self.rank == 0:
                             wandb.log(wandb_dict)

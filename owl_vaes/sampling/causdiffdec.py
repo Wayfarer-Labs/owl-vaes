@@ -67,7 +67,7 @@ def causal_diffdec_sample(
             noisy_video[:,-1] = noisy_video[:,-1] - dt_list[i] * pred[:,-1]
             ts[:,-1] = ts[:,-1] - dt_list[i]
         
-        generated_frames.append(noisy_video[:,-1])
+        generated_frames.append(noisy_video[:,-1].contiguous().clone())
         context = torch.cat([context[:,1:], noisy_video[:,-1:]], dim = 1)
     
     x = torch.stack(generated_frames, dim = 1)

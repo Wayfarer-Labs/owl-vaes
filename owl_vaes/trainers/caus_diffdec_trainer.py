@@ -250,7 +250,7 @@ class VideoDiffDecLiveDepthTrainer(BaseTrainer):
                                 proxy_z,
                                 teacher_z,
                                 self.train_cfg.sampling_steps,
-                                decoder = None,
+                                decoder = self.proxy.decoder if self.train_cfg.use_proxy else None,
                                 scaling_factor = self.train_cfg.ldm_scale,
                                 cfg_scale = cfg_scale
                             )

@@ -41,18 +41,9 @@ class DiffusionDecoderCore(nn.Module):
         self.ts_embed = TimestepEmbedding(config.d_model)
         
         self.proj_in_z = nn.Linear(config.latent_channels, config.d_model)
-
-        self.rope_impl = getattr(config, "rope_impl", None)
-        if self.rope_impl is None:
-            raise ValueError("rope_impl must be set; learned positional encodings are no longer supported.")
-
         self.final = FinalLayer(config, skip_proj = True)
 
-        if config.backbone == "dit":
-            self.blocks = DiT(config)
-        elif config.backbone == "hdit":
-            from ..nn.hdit import HDiT
-            self.blocks = HDiT(config)
+        self.blocks = DiT(config)
         self.config = config
 
         self.shuffle_factor = getattr(config, "shuffle_factor", 1)

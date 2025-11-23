@@ -150,6 +150,7 @@ class Attn(nn.Module):
         q, k = self.qk_norm(q, k)
         if self.rope is not None:
             q, k = self.rope(q, k)
+
         x_out = F.scaled_dot_product_attention(q, k, v, is_causal = self.causal, attn_mask = attn_mask)
         #x_out = flex_attention(q,k,v)
         x_out = x_out.to(x.dtype)
@@ -186,9 +187,10 @@ class CausalAttn(nn.Module):
         q, k = self.qk_norm(q, k)
         if self.rope is not None:
             q, k = self.rope(q, k)
+        q = q.to(v.dtype)
+        k = k.to(v.dtype)
 
         x_out = flex_attention(q,k,v,block_mask=attn_mask)
-        x_out = x_out.to(x.dtype)
 
         x_out = eo.rearrange(x_out, 'b h n d -> b n (h d)')
         x_out = self.out(x_out)
