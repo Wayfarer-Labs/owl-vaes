@@ -13,6 +13,8 @@ from ..nn.dit import DiT, FinalLayer
 
 from ..nn.embeddings import LearnedPosEnc
 from ..nn.embeddings import TimestepEmbedding, StepEmbedding
+from ..nn.attn import get_attn_mask
+from ..utils import int_to_tuple
 
 def is_landscape(sample_size):
     h,w = sample_size
@@ -47,6 +49,7 @@ class DiffusionDecoderCore(nn.Module):
         self.config = config
 
         self.shuffle_factor = getattr(config, "shuffle_factor", 1)
+        self.noise_scale = getattr(config, "noise_scale", 1.0)
         self.p_y, self.p_x = patch_size
         self.n_p_y = config.sample_size[0] // self.p_y
         self.n_p_x = config.sample_size[1] // self.p_x
@@ -54,11 +57,25 @@ class DiffusionDecoderCore(nn.Module):
         # Learned null embedding for CFG
         self.null_emb = nn.Parameter(torch.zeros(config.latent_channels, config.latent_size, config.latent_size))
 
-    def forward(self, x, z, ts):
+    def forward(self, x, z, ts, attn_mask = None):
         # x is [b,c,h,w]
         # z is [b,c,h,w] but different size cause latent
         # ts is [b,] in [0,1]
         # d is [b,] in [1,2,4,...,128]
+    
+        if attn_mask is None:
+            max_q = self.n_p_y * self.n_p_x
+            max_q += self.config.latent_size ** 2
+            max_kv = max_q
+
+            attn_mask = get_attn_mask(
+                self.config,
+                batch_size = x.shape[0],
+                device = x.device,
+                max_q_len = max_q,
+                max_kv_len = max_kv,
+                kernel_size = int_to_tuple(getattr(self.config, "kernel", None))
+            )
 
         if self.shuffle_factor > 1:
             x = F.pixel_unshuffle(x, self.shuffle_factor)
@@ -110,6 +127,12 @@ class DiffusionDecoder(nn.Module):
         self.ts_mu = 0.4
         self.ts_sigma = 1.0
         self.cfg_prob = getattr(config, "cfg_prob", 0.0)
+        self.x0_mode = getattr(config, "x0_mode", False)
+        self.noise_scale = getattr(config, "noise_scale", 1.0)
+
+        if self.x0_mode:
+            self.ts_mu = -0.8
+            self.ts_sigma = 0.8
 
     @torch.no_grad()
     def sample_timesteps(self, b, device, dtype):
@@ -123,11 +146,19 @@ class DiffusionDecoder(nn.Module):
         with torch.no_grad():
             ts = self.sample_timesteps(len(x), x.device, x.dtype)
 
-            eps = torch.randn_like(x)
+            eps = torch.randn_like(x) * self.noise_scale
             ts_exp = ts.view(-1, 1, 1, 1).expand_as(x)
 
-            lerpd = x * (1. - ts_exp) + ts_exp * eps
-            target = eps - x
+            if self.x0_mode:
+                lerpd = ts_exp * x + (1. - ts_exp) * eps
+            else:
+                lerpd = x * (1. - ts_exp) + ts_exp * eps
+
+            if self.x0_mode:
+                den = (1. - ts_exp).clamp(min=0.05)
+                target = (x - lerpd) / den
+            else:
+                target = eps - x
 
             # Apply CFG dropout: replace z with null embedding with probability cfg_prob
             if self.cfg_prob > 0:
@@ -136,10 +167,11 @@ class DiffusionDecoder(nn.Module):
                 z[mask] = self.core.null_emb.unsqueeze(0)
 
         pred = self.core(lerpd, z, ts)
+        if self.x0_mode:
+            pred = (pred - lerpd) / den
         diff_loss = F.mse_loss(pred, target)
 
         return diff_loss
-
 
 if __name__ == "__main__":
     from ..configs import Config
