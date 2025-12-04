@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .attn import Attn, CausalAttn
+from .attn import Attn
 from .mlp import MLP
 from .modulation import AdaLN, Gate
 
@@ -12,7 +12,7 @@ class DiTBlock(nn.Module):
     def __init__(self, config : 'TransformerConfig'):
         super().__init__()
 
-        self.attn = Attn(config) if not config.causal else CausalAttn(config)
+        self.attn = Attn(config)
         self.mlp = MLP(config)
 
         self.adaln1 = AdaLN(config)

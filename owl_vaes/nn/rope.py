@@ -31,7 +31,7 @@ class SimpleRoPE(nn.Module):
         self.dim_head = d_model // n_heads
         self.rope = RotaryEmbedding(self.dim_head, freqs_for="lang", theta = 300)
 
-    def forward(self, q, k, tread_mask = None):
+    def forward(self, q, k):
         q = self.apply(q)
         k = self.apply(k)
         return q, k
@@ -142,9 +142,9 @@ class ImageRoPEWithLatent(nn.Module):
 
         return x
     
-    def forward(self, q, k, tread_mask = None):
-        q = self.apply(q, tread_mask)
-        k = self.apply(k, tread_mask)
+    def forward(self, q, k):
+        q = self.apply(q)
+        k = self.apply(k)
         return q, k
 
 class VideoRoPEWithLatents(nn.Module):
