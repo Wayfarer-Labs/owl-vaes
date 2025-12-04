@@ -36,7 +36,7 @@ def get_attn_mask(
     if kernel_size is not None:
         k_y, k_x = int_to_tuple(kernel_size)
 
-    n_frames = config.n_frames
+    n_frames = getattr(config, "n_frames", 1)
     n_p_y = h // p_y
     n_p_x = w // p_x
     n_p_y_rope = n_p_y + config.latent_size
@@ -118,48 +118,7 @@ def get_attn_mask(
         device=device,
     )
 
-# TODO: Delete this and use the other as a default
 class Attn(nn.Module):
-    def __init__(self, config : TransformerConfig):
-        super().__init__()
-
-        self.n_heads = config.n_heads
-
-        self.qkv = nn.Linear(config.d_model, 3 * config.d_model, bias = False)
-        self.out = nn.Linear(config.d_model, config.d_model, bias = False)
-
-        self.qk_norm = QKNorm(config.d_model // config.n_heads)
-        rope_impl = getattr(config, "rope_impl", None)
-        if rope_impl is None:
-            self.rope = None
-        else:
-            self.rope = get_rope_impl(rope_impl)(config)
-        self.causal = config.causal
-
-        self.layer_ind = None
-
-        nn.init.zeros_(self.out.weight)
-
-    def forward(self, x, kv_cache = None, attn_mask = None):
-        # x: [b, n, d_model]
-
-        # Linear projection and split into q, k, v
-        qkv = self.qkv(x)  # [b, n, 3 * d_model]
-        q,k,v = eo.rearrange(qkv, 'b n (three h d) -> three b h n d', h = self.n_heads, three = 3)
-
-        q, k = self.qk_norm(q, k)
-        if self.rope is not None:
-            q, k = self.rope(q, k)
-
-        x_out = F.scaled_dot_product_attention(q, k, v, is_causal = self.causal, attn_mask = attn_mask)
-        #x_out = flex_attention(q,k,v)
-        x_out = x_out.to(x.dtype)
-
-        x_out = eo.rearrange(x_out, 'b h n d -> b n (h d)')
-        x_out = self.out(x_out)
-        return x_out
-
-class CausalAttn(nn.Module):
     """
     Causal attention for causal diffusion decoder
     """
@@ -172,7 +131,7 @@ class CausalAttn(nn.Module):
         self.out = nn.Linear(config.d_model, config.d_model, bias = False)
 
         self.qk_norm = QKNorm(config.d_model // config.n_heads)
-        self.rope = get_rope_impl("video+latent")(config)
+        self.rope = get_rope_impl(config.rope_impl)(config)
 
         self.layer_ind = None
         nn.init.zeros_(self.out.weight)
@@ -205,7 +164,7 @@ class Transformer(nn.Module):
         self.norm1 = LayerNorm(dim)
         self.norm2 = LayerNorm(dim)
 
-        self.attn = Attn(config) if not config.causal else CausalAttn(config)
+        self.attn = Attn(config)
         self.mlp = MLP(config)
 
     def forward(self, x, kv_cache = None, attn_mask = None):
@@ -270,44 +229,6 @@ class PatchProjOut(nn.Module):
         x = eo.rearrange(x, 'b (h w) (ph pw c) -> b c (h ph) (w pw)', h = self.n_patches, ph = self.patch_size, pw = self.patch_size)
 
         return x
-
-class TemporalAttn(nn.Module):
-    def __init__(self, d_model, n_heads, n_frames, layer_ind = None):
-        super().__init__()
-
-        self.n_frames = n_frames
-        self.qkv = nn.Linear(d_model, 3 * d_model)
-        self.qk_norm = QKNorm(d_model // n_heads)
-        self.rope = get_rope_impl("simple")(d_model, n_heads)
-        self.layer_ind = layer_ind
-
-    def forward(self, x, kv_cache = None):
-        # x is [b*n, c, h, w]
-        bn,c,h,w = x.shape
-        b = bn//self.n_frames
-
-        x = x.view(b, self.n_frames, c, h, w)
-        x = x.permute(0,3,4,1,2).view(b*h*w,self.n_frames,c)
-        # bhw,n,c
-
-        qkv = self.qkv(x)
-        qkv = qkv.view(b*h*w, self.n_frames, 3, n_heads, c//n_heads)
-        qkv = qkv.permute(2,0,3,1,4) # 3,bhw,n_heads,n_frames,d_model//n_heads
-        q,k,v = qkv[0], qkv[1], qkv[2]
-
-        q,k = self.qk_norm(q,k)
-        q,k = self.rope(q,k)
-
-        x = flex_attention(q,k,v,is_causal=True)
-        x = x.view(b,h,w,self.n_frames,c)
-        x = x.permute(0,3,4,1,2)
-        x = x.view(b*self.n_frames,c,h,w)
-
-        return x
-
-# ===== Conv ATTN =====
-
-# TODO, replace my own deleted code
 
 def attn_test():
     cfg = TransformerConfig(
