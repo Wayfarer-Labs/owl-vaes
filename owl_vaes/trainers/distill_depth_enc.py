@@ -93,7 +93,7 @@ class DistillDepthEncTrainer(BaseTrainer):
         self.model.load_state_dict(save_dict['model'])
         self.opt.load_state_dict(save_dict['opt'])
         if self.scheduler is not None and 'scheduler' in save_dict:
-            self.scheduler.state_dict(save_dict['scheduler'])
+            self.scheduler.load_state_dict(save_dict['scheduler'])
         self.scaler.load_state_dict(save_dict['scaler'])
         self.total_step_counter = save_dict['steps']
         if self.ema is not None:
@@ -129,7 +129,7 @@ class DistillDepthEncTrainer(BaseTrainer):
 
         self.ema = EMA(
             self.model,
-            beta = 0.9999,
+            beta = 0.995,
             update_after_step = 0,
             update_every = 1
         )

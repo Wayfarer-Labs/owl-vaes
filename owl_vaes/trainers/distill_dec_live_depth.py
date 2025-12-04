@@ -65,8 +65,10 @@ class DistillDecLiveDepthTrainer(BaseTrainer):
                 encoder.load_state_dict(encoder_ckpt)
             except:
                 encoder.encoder.load_state_dict(encoder_ckpt)
-            encoder.encoder.skip_logvar = False
-            encoder.encoder.conv_out_logvar = self.encoder.conv_out_logvar
+            
+            if encoder.encoder.skip_logvar:
+                encoder.encoder.skip_logvar = False
+                encoder.encoder.conv_out_logvar = self.encoder.conv_out_logvar
             self.encoder = encoder.encoder
 
         model_id = self.model_cfg.model_id
@@ -174,6 +176,7 @@ class DistillDecLiveDepthTrainer(BaseTrainer):
         self.encoder = self.encoder.to(self.device).bfloat16()
         freeze(self.encoder)
         self.encoder = torch.compile(self.encoder)#, mode='max-autotune',dynamic=False,fullgraph=True)
+        self.teacher_decoder = self.teacher_decoder.to(self.device).bfloat16()
 
         # Depth prep
         self.depth = self.depth.to(self.device).bfloat16()
@@ -323,9 +326,10 @@ class DistillDecLiveDepthTrainer(BaseTrainer):
                         if self.total_step_counter % self.train_cfg.sample_interval == 0:
                             with ctx:
                                 ema_rec = self.ema.ema_model(teacher_z)
+                            teacher_rec = self.teacher_decoder(teacher_z.bfloat16())[:,:3]
 
                             wandb_dict['samples'] = to_wandb(
-                                batch.detach().contiguous().bfloat16(),
+                                teacher_rec.detach().contiguous().bfloat16(),
                                 ema_rec.detach().contiguous().bfloat16(),
                                 gather = False
                             )
