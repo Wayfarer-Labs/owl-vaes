@@ -176,8 +176,7 @@ class RecLiveDepthTrainer(BaseTrainer):
                         metrics.log('l2_loss', l2_loss)
 
                     if dwt_weight > 0.0:
-                        with ctx:
-                            dwt_loss = dwt_loss_fn(batch_rec[:,:3], batch[:,:3]) / accum_steps
+                        dwt_loss = dwt_loss_fn(batch_rec[:,:3], batch[:,:3]) / accum_steps
                         total_loss += dwt_loss * dwt_weight
                         metrics.log('dwt_loss', dwt_loss)
 
