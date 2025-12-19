@@ -107,7 +107,6 @@ def get_attn_mask(
             )
 
             return causal_mask & nbr_mask
-
     
     return create_block_mask(
         can_attend_to,
