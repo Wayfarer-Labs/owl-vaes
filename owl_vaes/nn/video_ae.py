@@ -4,9 +4,12 @@ import torch.nn.functional as F
 
 import math
 import einops as eo
+from copy import deepcopy
 
 from .resnet import WeightNormConv2d
 from .normalization import LayerNorm
+from .attn import Attn
+from ..utils import int_to_tuple
 
 """
 Video VAE building blocks
@@ -14,6 +17,7 @@ Video VAE building blocks
 
 class TemporalDownsample(nn.Module):
     def __init__(self, ch):
+        super().__init__()
         self.proj = WeightNormConv2d(2*ch, ch, 3, 1, 1)
 
     def forward(self, x):
@@ -26,6 +30,7 @@ class TemporalDownsample(nn.Module):
 
 class TemporalUpsample(nn.Module):
     def __init__(self, ch):
+        super().__init__()
         self.proj = WeightNormConv2d(ch, 2*ch, 3, 1, 1)
 
     def forward(self, x):
@@ -43,50 +48,43 @@ Assumes the incoming videos are square
 Token count is number of patches per side
 """
 
-class BatchedWeightNormConv2D(WeightNormConv2d):
-    """
-    Handles reshape in/out for temporal dim
-    """
-    def forward(self, x):
-        b,t = x.shape[:2]
-        x = eo.rearrange(x, 'b t c h w -> (b t) c h w')
-        x = super().forward(x)
-        x = eo.rearrange(x, '(b t) c h w -> b t c h w', b = b)
-        return x
-
 class SmartPatchIn(nn.Module):
     def __init__(self, ch, d_model, desired_token_count = 16):
         super().__init__()
 
         self.n_p = desired_token_count
-        self.proj = BatchedWeightNormConv2D(ch, d_model, 3, 1, 1)
+        self.proj = WeightNormConv2d(ch, d_model, 3, 1, 1)
     
     def forward(self, x):
         # x is [b,t,c,h,w]
         # pool to downsample to desired_token_count
+        b = x.shape[0]
+        x = eo.rearrange(x, 'b t c h w -> (b t) c h w')
         x = self.proj(x)
         x = F.interpolate(x, size=(self.n_p, self.n_p))
-        return eo.rearrange(
-            x, 
-            'b t c h w -> b (t h w) c',
-        )
+        x = eo.rearrange(x, '(b t) c h w -> b (t h w) c ', b = b)
         return x
 
 
 class SmartPatchOut(nn.Module):
-    def __init__(self, ch, d_model):
+    def __init__(self, ch, d_model, desired_token_count = 16):
         super().__init__()
 
-        self.proj = BatchedWeightNormConv2D(d_model, ch, 3, 1, 1)
+        self.n_p = desired_token_count
+        self.proj = WeightNormConv2d(d_model, ch, 3, 1, 1)
     
     def forward(self, x, h, w):
         # x is [b,t,c,h,w]
+        b = x.shape[0]
         x = eo.rearrange(
             x,
-            'b (t h w) c -> b t c h w',
+            'b (t h w) c -> (b t) c h w',
+            h = self.n_p,
+            w = self.n_p,
         )
         x = F.interpolate(x, size = (h, w))
         x = self.proj(x)
+        x = eo.rearrange(x, '(b t) c h w -> b t c h w', b = b)
         return x
 
 def get_frame_causal_attn_mask(
@@ -137,8 +135,8 @@ class CausalFrameAttn(nn.Module):
         super().__init__()
 
         self.norm = LayerNorm(config.d_model)
-        self.proj_in = SmartPatchIn(ch)
-        self.proj_out = SmartPatchOut(ch)
+        self.proj_in = SmartPatchIn(ch, config.d_model)
+        self.proj_out = SmartPatchOut(ch, config.d_model)
         self.attn = Attn(config)
     
     def forward(self, x, kv_cache = None, attn_mask = None):

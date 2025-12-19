@@ -268,7 +268,6 @@ class VideoRoPE(nn.Module):
 
         self.n_p_y = n_p_y
         self.n_p_x = n_p_x
-        self.n_frames = n_frames
         self.n_heads = config.n_heads
 
     def apply(self, x):
@@ -277,18 +276,14 @@ class VideoRoPE(nn.Module):
         b,h,n,d = x.shape
         x = eo.rearrange(
             x,
-            'b h n_frames n_p_y n_p_x d -> b h (n_frames n_p_y n_p_x) d',
-            n_frames = self.n_frames,
+            'b h (n_frames n_p_y n_p_x) d -> b h n_frames n_p_y n_p_x d',
             n_p_y = self.n_p_y,
             n_p_x = self.n_p_x,
         )
-        x = apply_rotary_emb(self.freqs.detach().float(), x.float()).to(x.dtype)
+        x = apply_rotary_emb(self.freqs[-x.shape[2]:].detach().float(), x.float()).to(x.dtype)
         x = eo.rearrange(
             x,
-            'b h (n_frames n_p_y n_p_x) d -> b h n_frames n_p_y n_p_x d',
-            n_frames = self.n_frames,
-            n_p_y = self.n_p_y,
-            n_p_x = self.n_p_x,
+            'b h n_frames n_p_y n_p_x d -> b h (n_frames n_p_y n_p_x) d',
         )
         return x.to(orig_dtype)
     

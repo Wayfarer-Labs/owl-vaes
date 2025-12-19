@@ -24,7 +24,7 @@ from torch.utils.checkpoint import checkpoint
 import torch.distributions as dist
 from copy import deepcopy
 
-def is_landscape(config : 'ResNetConfig'):
+def is_landscape(config):
     sample_size = config.sample_size
     if isinstance(sample_size, int):
         return False
@@ -33,16 +33,26 @@ def is_landscape(config : 'ResNetConfig'):
         return True
     return False
 
+def batch(x):
+    b,t,c,h,w = x.shape
+    x = x.reshape(b*t, c, h, w)
+    return x
+
+def unbatch(x, b):
+    _, c, h, w = x.shape
+    x = x.reshape(b, -1, c, h, w)
+    return x
+
 class Encoder(nn.Module):
     def __init__(self, config : 'ResNetConfig'):
         super().__init__()
 
+        self.config = config
         size = config.sample_size
         latent_size = config.latent_size
         ch_0 = config.ch_0
         ch_max = config.ch_max
         self.skip_logvar = getattr(config, "skip_logvar", False)
-        self.skip_residuals = getattr(config, "skip_residuals", False)
 
         self.latent_channels = config.latent_channels
         self.is_landscape = is_landscape(config)
@@ -64,13 +74,13 @@ class Encoder(nn.Module):
             next_ch = min(ch*2, ch_max)
 
             blocks.append(DownBlock(ch, next_ch, block_count, total_blocks))
-            residuals.append(SpaceToChannel(ch, next_ch)) if not self.skip_residuals else None
+            residuals.append(SpaceToChannel(ch, next_ch))
             attn_blocks.append(CausalFrameAttn(next_ch, attn_config))
 
             ch = next_ch
 
         self.blocks = nn.ModuleList(blocks)
-        self.residuals = nn.ModuleList(residuals) if not self.skip_residuals else None
+        self.residuals = nn.ModuleList(residuals)
         self.attn_blocks = nn.ModuleList(attn_blocks)
         self.avg_factor = ch // config.latent_channels
         
@@ -86,20 +96,6 @@ class Encoder(nn.Module):
             nn.Identity(),
         ])
 
-    @torch.no_grad()
-    def sample(self, x):
-        mu, logvar = self.forward(x)
-        return mu + (logvar/2).exp() * torch.randn_like(mu)
-
-    def batch(self, x):
-        b,t,c,h,w = x.shape
-        x = x.reshape(b*t, c, h, w)
-        return x
-    
-    def unbatch(self, x, b):
-        x = x.reshape(b, -1, c, h, w)
-        return x
-
     def forward(self, x, kv_cache = None, attn_mask = None):
         if attn_mask is None:
             attn_mask = get_frame_causal_attn_mask(
@@ -108,22 +104,22 @@ class Encoder(nn.Module):
                 device = x.device,
                 max_q_len = x.shape[1],
                 max_kv_len = x.shape[1],
-                kernel_size = int_to_tuple(getattr(self.config, "kernel", None))
+                kernel_size = getattr(self.config, "kernel", None)
             )
 
         b = x.shape[0]
-        x = self.batch(x)
+        x = batch(x)
         x = self.conv_in(x)
         for i, (block, shortcut, attn, down) in enumerate(zip(self.blocks, self.residuals, self.attn_blocks, self.down)):
             res = shortcut(x)
             x = block(x) + res
-            x = self.unbatch(x, b)
+            x = unbatch(x, b)
             x = attn(x, kv_cache, attn_mask)
             x = down(x)
-            x = self.batch(x)
+            x = batch(x)
 
         mu = self.conv_out(x)
-        mu = self.unbatch(mu, b)
+        mu = unbatch(mu, b)
 
         if not self.training:
             return mu
@@ -132,7 +128,7 @@ class Encoder(nn.Module):
                 return mu
             logvar = self.conv_out_logvar(x)
             logvar = logvar.repeat(1, self.latent_channels, 1, 1)
-            logvar = self.unbatch(logvar, b)
+            logvar = unbatch(logvar, b)
             return mu, logvar
 
 class Decoder(nn.Module):
@@ -140,7 +136,6 @@ class Decoder(nn.Module):
         super().__init__()
 
         self.config = config
-        self.skip_residuals = getattr(config, "skip_residuals", False)
         self.is_landscape = is_landscape(config)
 
         size = config.sample_size
@@ -163,18 +158,18 @@ class Decoder(nn.Module):
         blocks_per_stage = config.decoder_blocks_per_stage
         total_blocks = len(blocks_per_stage)
 
-        for block_count in reversed(blocks_per_stage):
+        for block_count in blocks_per_stage:
             next_ch = min(ch*2, ch_max)
 
             blocks.append(UpBlock(next_ch, ch, block_count, total_blocks))
-            residuals.append(ChannelToSpace(next_ch, ch)) if not self.skip_residuals else None
+            residuals.append(ChannelToSpace(next_ch, ch))
             attn_blocks.append(CausalFrameAttn(next_ch, attn_config))
 
             ch = next_ch
 
-        self.blocks = nn.ModuleList(blocks)
-        self.residuals = nn.ModuleList(residuals)
-        self.attn_blocks = nn.ModuleList(attn_blocks)
+        self.blocks = nn.ModuleList(list(reversed(blocks)))
+        self.residuals = nn.ModuleList(list(reversed(residuals)))
+        self.attn_blocks = nn.ModuleList(list(reversed(attn_blocks)))
 
         self.conv_out = SquareToLandscape(ch_0, config.channels) if self.is_landscape else WeightNormConv2d(ch_0, config.channels, 3, 1, 1)
         self.act_out = nn.SiLU()
@@ -186,31 +181,32 @@ class Decoder(nn.Module):
             nn.Identity(),
         ])
 
-    def batch(self, x):
-        b,t,c,h,w = x.shape
-        x = x.reshape(b*t, c, h, w)
-        return x
-    
-    def unbatch(self, x, b):
-        x = x.reshape(b, -1, c, h, w)
-        return x
+    def forward(self, x, kv_cache = None, attn_mask = None):
+        if attn_mask is None:
+            attn_mask = get_frame_causal_attn_mask(
+                self.config,
+                batch_size = x.shape[0],
+                device = x.device,
+                max_q_len = x.shape[1],
+                max_kv_len = x.shape[1],
+                kernel_size = getattr(self.config, "kernel", None)
+            )
 
-    def forward(self, x):
         b = x.shape[0]
-        x = self.batch(x)
+        x = batch(x)
         x = self.conv_in(x)
 
         for i, (block, shortcut, attn, up) in enumerate(zip(self.blocks, self.residuals, self.attn_blocks, self.up)):
+            x = unbatch(x, b)
+            x = up(x)
+            x = attn(x, kv_cache, attn_mask)
+            x = batch(x)
             res = shortcut(x)
             x = block(x) + res
-            x = self.unbatch(x, b)
-            x = attn(x, kv_cache, attn_mask)
-            x = up(x)
-            x = self.batch(x)
 
         x = self.act_out(x)
         x = self.conv_out(x)
-        x = self.unbatch(x, b)
+        x = unbatch(x, b)
         return x
 
 class VideoDCAE(nn.Module):
@@ -233,30 +229,37 @@ class VideoDCAE(nn.Module):
         return rec
 
 def test_video_dcae():
-    config = ResNetConfig(
-        sample_size = [360, 640],
-        channels = 3,
-        latent_size = 16,
-        latent_channels = 16,
-        ch_0 = 256,
-        ch_max = 2048,
-        d_model = 768,
-        n_heads = 12,
-        encoder_blocks_per_stage = [4, 4, 4, 8],
-        decoder_blocks_per_stage = [4, 4, 4, 8],
-        tokens_per_frame = 256,
+    from dataclasses import dataclass
+    @dataclass
+    class VideoDCAEConfig:
+        sample_size = (360, 640)
+        channels = 3
+        latent_size = 16
+        latent_channels = 16
+        ch_0 = 256
+        ch_max = 2048
+        d_model = 768
+        n_heads = 12
+        encoder_blocks_per_stage = [4, 4, 4, 8]
+        decoder_blocks_per_stage = [4, 4, 4, 8]
+        tokens_per_frame = 256
         rope_impl = "video"
-    )
+        n_frames = 16
+    
+    config = VideoDCAEConfig()
     model = VideoDCAE(config)
     model = model.cuda().bfloat16()
 
     with torch.no_grad():
-        x = torch.randn(1, 8, 3, 360, 640).cuda().bfloat16()
+        x = torch.randn(1, config.n_frames, config.channels, config.sample_size[0], config.sample_size[1]).cuda().bfloat16()
         mu, logvar = model.encoder(x)
         print(mu.shape)
         print(logvar.shape)
         z = torch.randn_like(mu) * (logvar/2).exp() + mu
         rec = model.decoder(z)
         print(rec.shape)
+
+if __name__ == "__main__":
+    test_video_dcae()
     
 
