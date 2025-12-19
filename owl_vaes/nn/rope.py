@@ -17,6 +17,8 @@ def get_rope_impl(impl_name):
         return ImageRoPEWithLatent
     elif impl_name == "video+latent":
         return VideoRoPEWithLatents
+    elif impl_name == "video":
+        return VideoRoPE
     else:
         raise ValueError(f"Invalid rope implementation: {impl_name}")
 
@@ -230,6 +232,64 @@ class VideoRoPEWithLatents(nn.Module):
         )
         x = torch.cat([x_video, x_latent], dim = 2)
 
+        return x.to(orig_dtype)
+    
+    def forward(self, q, k):
+        q = self.apply(q)
+        k = self.apply(k)
+        return q, k
+
+class VideoRoPE(nn.Module):
+    """
+    Same as above but without any latents (simplifies a lot)
+    """
+    def __init__(self, config):
+        super().__init__()
+
+        h,w = int_to_tuple(config.sample_size)
+        p_y, p_x = int_to_tuple(config.patch_size)
+        n_frames = config.n_frames
+
+        n_p_y = h // p_y
+        n_p_x = w // p_x
+
+        dim_head = config.d_model // config.n_heads
+        rope_emb = RotaryEmbedding(
+            dim_head // 8,
+            freqs_for = 'pixel',
+            max_freq = min(n_p_y, n_p_x) * 0.8
+        )
+        freqs = rope_emb.get_axial_freqs(
+            n_frames,
+            n_p_y,
+            n_p_x
+        )
+        self.register_buffer('freqs', freqs, persistent=False)
+
+        self.n_p_y = n_p_y
+        self.n_p_x = n_p_x
+        self.n_frames = n_frames
+        self.n_heads = config.n_heads
+
+    def apply(self, x):
+        orig_dtype = x.dtype
+
+        b,h,n,d = x.shape
+        x = eo.rearrange(
+            x,
+            'b h n_frames n_p_y n_p_x d -> b h (n_frames n_p_y n_p_x) d',
+            n_frames = self.n_frames,
+            n_p_y = self.n_p_y,
+            n_p_x = self.n_p_x,
+        )
+        x = apply_rotary_emb(self.freqs.detach().float(), x.float()).to(x.dtype)
+        x = eo.rearrange(
+            x,
+            'b h (n_frames n_p_y n_p_x) d -> b h n_frames n_p_y n_p_x d',
+            n_frames = self.n_frames,
+            n_p_y = self.n_p_y,
+            n_p_x = self.n_p_x,
+        )
         return x.to(orig_dtype)
     
     def forward(self, q, k):
