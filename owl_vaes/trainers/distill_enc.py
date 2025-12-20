@@ -62,6 +62,8 @@ class DistillEncTrainer(BaseTrainer):
         self.total_step_counter = 0
         self.ema = None
 
+        self.model_input_size = [int(self.model_cfg.sample_size[0]), int(self.model_cfg.sample_size[1])]
+
     def save(self):
         save_dict = {
             'model' : self.model.state_dict(),
@@ -82,7 +84,7 @@ class DistillEncTrainer(BaseTrainer):
         self.model.load_state_dict(save_dict['model'])
         self.opt.load_state_dict(save_dict['opt'])
         if self.scheduler is not None and 'scheduler' in save_dict:
-            self.scheduler.state_dict(save_dict['scheduler'])
+            self.scheduler.load_state_dict(save_dict['scheduler'])
         self.scaler.load_state_dict(save_dict['scaler'])
         self.total_step_counter = save_dict['steps']
         if self.ema is not None:
@@ -94,6 +96,7 @@ class DistillEncTrainer(BaseTrainer):
         # Loss weights
         l1_weight = self.train_cfg.loss_weights.get('l1', 0.0)
         l2_weight = self.train_cfg.loss_weights.get('l2', 1.0)
+        logvar_weight = self.train_cfg.loss_weights.get('logvar', 0.0)
         student_ch = self.model_cfg.channels
 
         # Prepare model
@@ -101,9 +104,9 @@ class DistillEncTrainer(BaseTrainer):
         if self.world_size > 1:
             self.model = DDP(self.model)
 
-        self.teacher_encoder = self.teacher_encoder.to(self.device).bfloat16().eval()
+        self.teacher_encoder = self.teacher_encoder.to(self.device).bfloat16()
         freeze(self.teacher_encoder)
-        self.teacher_encoder = torch.compile(self.teacher_encoder, mode='max-autotune', dynamic=False, fullgraph=True)
+        self.teacher_encoder = torch.compile(self.teacher_encoder)#, mode='max-autotune', dynamic=False, fullgraph=True)
         
         self.teacher_decoder = self.teacher_decoder.to(self.device).bfloat16().eval()
         freeze(self.teacher_decoder)
@@ -114,14 +117,17 @@ class DistillEncTrainer(BaseTrainer):
 
         self.ema = EMA(
             self.model,
-            beta = 0.9999,
+            beta = 0.995,
             update_after_step = 0,
             update_every = 1
         )
 
         # Set up optimizer and scheduler
-        opt_cls = getattr(torch.optim, self.train_cfg.opt)
-        self.opt = opt_cls(self.model.parameters(), **self.train_cfg.opt_kwargs)
+        if self.train_cfg.opt.lower() == "muon":
+            self.opt = init_muon(self.model, rank=self.rank, world_size=self.world_size, **self.train_cfg.opt_kwargs)
+        else:
+            opt_cls = getattr(torch.optim, self.train_cfg.opt)
+            self.opt = opt_cls(self.model.parameters(), **self.train_cfg.opt_kwargs)
 
         if self.train_cfg.scheduler is not None:
             from ..schedulers import get_scheduler_cls
@@ -176,24 +182,54 @@ class DistillEncTrainer(BaseTrainer):
             for batch in loader:
                 total_loss = 0.
                 batch = batch.to(self.device).bfloat16()
+                full_batch = batch.clone()
+                batch = F.interpolate(batch, self.model_input_size, mode='bilinear', align_corners=False)
 
                 with ctx:
                     with torch.no_grad():
-                        teacher_z = self.teacher_encoder(batch)
-                        target = divide_latent_scale(teacher_z)
-                    
-                    student_z = self.model(batch[:,:student_ch])
+                        teacher_output = self.teacher_encoder(batch)
+                        skip_logvar = getattr(self.model_cfg, 'skip_logvar', False)
+
+                        if skip_logvar:
+                            teacher_mu = teacher_output
+                            teacher_logvar = None
+                        else:
+                            teacher_mu, teacher_logvar = teacher_output
+
+                        target_mu = divide_latent_scale(teacher_mu)
+                        if teacher_logvar is not None:
+                            target_logvar = divide_latent_scale(teacher_logvar)
+                        else:
+                            target_logvar = None
+
+                    target_mu = target_mu.bfloat16()
+                    if target_logvar is not None:
+                        target_logvar = target_logvar.bfloat16()
+
+                    # Get student encoder output (mu, logvar if not skip_logvar)
+                    student_output = self.model(batch[:,:student_ch])
+
+                    if skip_logvar:
+                        student_mu = student_output
+                        student_logvar = None
+                    else:
+                        student_mu, student_logvar = student_output
 
                     # Loss computation
                     if l2_weight > 0.0:
-                        l2_loss = F.mse_loss(student_z, target) / accum_steps
+                        l2_loss = F.mse_loss(student_mu, target_mu) / accum_steps
                         total_loss += l2_loss * l2_weight
                         metrics.log('l2_loss', l2_loss)
-                    
+
                     if l1_weight > 0.0:
-                        l1_loss = F.l1_loss(student_z, target) / accum_steps
+                        l1_loss = F.l1_loss(student_mu, target_mu) / accum_steps
                         total_loss += l1_loss * l1_weight
                         metrics.log('l1_loss', l1_loss)
+
+                    if logvar_weight > 0.0 and student_logvar is not None and target_logvar is not None:
+                        logvar_loss = F.mse_loss(student_logvar, target_logvar) / accum_steps
+                        total_loss += logvar_loss * logvar_weight
+                        metrics.log('logvar_loss', logvar_loss)
 
                     self.scaler.scale(total_loss).backward()
 
@@ -203,8 +239,9 @@ class DistillEncTrainer(BaseTrainer):
                         self.ema.update()
 
                     # Updates
-                    self.scaler.unscale_(self.opt)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    if self.train_cfg.opt.lower() != "muon":
+                        self.scaler.unscale_(self.opt)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
 
                     self.scaler.step(self.opt)
                     self.opt.zero_grad(set_to_none=True)
@@ -221,23 +258,24 @@ class DistillEncTrainer(BaseTrainer):
                         wandb_dict['lr'] = self.opt.param_groups[0]['lr']
                         timer.reset()
 
-                        student_z = student_z.clone()
-
-                        #if True: # Logging LPIPs, might slow shit down
-                        #    with ctx:
-                        #        student_rec = self.teacher_decoder(
-                        #            multiply_latent_scale(student_z)
-                        #        )
-                        #        lpips_loss = lpips(student_rec, batch[:,:3])
-                        #        wandb_dict['lpips_loss'] = lpips_loss.item()
-
+                        student_z = student_mu.clone()
 
                         if self.total_step_counter % self.train_cfg.sample_interval == 0:
                             with ctx:
-                                teacher_latent = self.teacher_encoder(batch).clone()
-                                student_latent = self.ema.ema_model(batch[:,:student_ch]).clone()
+                                teacher_output = self.teacher_encoder(full_batch)
+                                if skip_logvar:
+                                    teacher_latent = teacher_output.clone()
+                                else:
+                                    teacher_latent = teacher_output[0].clone()  # Use mu
+
+                                student_output = self.ema.ema_model(full_batch[:,:student_ch])
+                                if skip_logvar:
+                                    student_latent = student_output.clone()
+                                else:
+                                    student_latent = student_output[0].clone()  # Use mu
+
                                 student_latent = multiply_latent_scale(student_latent)
-                                
+
                                 teacher_rec = self.teacher_decoder(teacher_latent.detach().clone()).clone()
                                 student_rec = self.teacher_decoder(student_latent.detach().clone()).clone()
 
@@ -246,16 +284,6 @@ class DistillEncTrainer(BaseTrainer):
                                 student_rec[:,:3].detach().contiguous().bfloat16(),
                                 gather = False
                             )
-
-                            # Log depth maps if present (4 or 7 channels)
-                            if batch.shape[1] >= 4:
-                                depth_samples = to_wandb_grayscale(
-                                    teacher_rec[:,3].unsqueeze(1).detach().contiguous().bfloat16(),
-                                    student_rec[:,3].unsqueeze(1).detach().contiguous().bfloat16(),
-                                    gather = False
-                                )
-                                if depth_samples:
-                                    wandb_dict['depth_samples'] = depth_samples
 
                         if self.rank == 0:
                             wandb.log(wandb_dict)
