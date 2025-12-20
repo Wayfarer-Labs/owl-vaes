@@ -63,5 +63,8 @@ def get_trainer_cls(trainer_id: Literal["rec", "proxy", "audio_rec"]):
         case "caus_diffdec_depth":
             from .caus_diffdec_trainer import VideoDiffDecLiveDepthTrainer
             return VideoDiffDecLiveDepthTrainer
+        case "video_rec":
+            from .video_rec import VideoRecTrainer
+            return VideoRecTrainer
         case _:
             raise NotImplementedError

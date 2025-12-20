@@ -91,8 +91,8 @@ class Encoder(nn.Module):
         # TODO, this is sloppy
         self.down = nn.ModuleList([
             nn.Identity(),
-            TemporalDownsample(ch_0 * 4),
-            TemporalDownsample(ch_0 * 8),
+            TemporalDownsample(min(ch_0 * 4, ch_max)),
+            TemporalDownsample(min(ch_0 * 8, ch_max)),
             nn.Identity(),
         ])
 
@@ -176,8 +176,8 @@ class Decoder(nn.Module):
 
         self.up = nn.ModuleList([
             nn.Identity(),
-            TemporalUpsample(ch_0 * 8),
-            TemporalUpsample(ch_0 * 4),
+            TemporalUpsample(min(ch_0 * 8, ch_max)),
+            TemporalUpsample(min(ch_0 * 4, ch_max)),
             nn.Identity(),
         ])
 
@@ -226,7 +226,7 @@ class VideoDCAE(nn.Module):
         z = torch.randn_like(mu) * (logvar/2).exp() + mu
 
         rec = self.decoder(z)
-        return rec
+        return rec, mu, logvar
 
 def test_video_dcae():
     from dataclasses import dataclass

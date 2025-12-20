@@ -43,4 +43,7 @@ def get_model_cls(model_id: str) -> Any:
     if model_id == "causal_audio":
         from .causal_audio import CausalAudioVAE
         return CausalAudioVAE
+    if model_id == "video_dcae":
+        from .video_dcae import VideoDCAE
+        return VideoDCAE
     return None
