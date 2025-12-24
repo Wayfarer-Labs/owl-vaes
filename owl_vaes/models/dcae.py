@@ -26,6 +26,12 @@ def is_landscape(config : 'ResNetConfig'):
         return True
     return False
 
+def latent_ln(z, eps=1e-6):
+    # z: [b, c, h, w]
+    mean = z.mean(dim=(1, 2, 3), keepdim=True)
+    var  = z.var(dim=(1, 2, 3), keepdim=True, unbiased=False)
+    return (z - mean) / torch.sqrt(var + eps)
+
 class Encoder(nn.Module):
     def __init__(self, config : 'ResNetConfig'):
         super().__init__()
@@ -68,6 +74,7 @@ class Encoder(nn.Module):
         #self.conv_out = weight_norm(nn.Conv2d(ch, config.latent_channels, 3, 1, 1))
         
         self.conv_out_logvar = WeightNormConv2d(ch, 1, 3, 1, 1) if not self.skip_logvar else None
+        self.normalize_mu = getattr(config, 'normalize_mu', False)
 
     @torch.no_grad()
     def sample(self, x):
@@ -87,6 +94,9 @@ class Encoder(nn.Module):
         if self.use_middle_block:
             x = self.middle_block(x) + x
         mu = self.conv_out(x)
+
+        if self.normalize_mu:
+            mu = latent_ln(mu)
 
         if not self.training:
             return mu

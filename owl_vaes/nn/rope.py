@@ -58,13 +58,14 @@ class ImageRoPE(nn.Module):
         rope_emb = RotaryEmbedding(
             dim_head // 4,
             freqs_for = 'pixel',
-            max_freq = 256
+            max_freq = min(n_p_y, n_p_x) * 0.8
         )
         freqs = rope_emb.get_axial_freqs(
             n_p_y,
             n_p_x
         )
         self.register_buffer('freqs', freqs, persistent=False)
+
         self.n_p_y = n_p_y
         self.n_p_x = n_p_x
 
