@@ -1,0 +1,80 @@
+model:
+  model_id: dcae
+  sample_size: [360, 640]
+  channels: 3
+  latent_size: 32
+  latent_channels: 16
+
+  ch_0: 64
+  ch_max: 256
+
+  encoder_blocks_per_stage: [1, 1, 1, 1]
+  decoder_blocks_per_stage: [1, 1, 1, 1]
+
+  use_middle_block: false
+  do_channel_mask: false
+  skip_logvar: false
+
+train:
+  trainer_id: distill_enc
+  data_id: video_dir_loader
+  data_kwargs:
+    source: 
+     - /mnt/data/datasets/extracted_tars/kbm/fps/*/*.mp4
+     - /mnt/data/datasets/extracted_tars/kbm/3ps/*/*.mp4
+     - /mnt/data/datasets/extracted_tars/kbm/other/*/*.mp4
+    target_size: [360, 640]
+
+  target_batch_size: 256
+  batch_size: 32
+
+  epochs: 200
+
+ # opt: AdamW
+ # opt_kwargs:
+ #   lr: 3.0e-5
+ #   weight_decay: 1.0e-4
+ #   betas: [0.9, 0.95]
+ #   eps: 1.0e-15
+
+  opt: Muon
+  opt_kwargs:
+    lr: 5.0e-4
+    momentum: 0.95
+    adamw_lr: 1.0e-4
+    adamw_wd: 1.0e-2
+    adamw_eps: 1.0e-6
+    adamw_betas: [0.9, 0.95]
+    adamw_keys:
+      - conv_in
+      - conv_out
+      - conv_out_logvar
+      - .down.
+      - .residuals.
+
+  lpips_type: convnext
+  loss_weights:
+    l2: 1.0
+    logvar: 1.0
+
+  scheduler: LinearWarmup
+  scheduler_kwargs:
+    warmup_steps: 1500
+    min_lr: 1.0e-5
+
+  checkpoint_dir: checkpoints/waypoint_1_vae_owlc_f16_c16_enc_distill
+  resume_ckpt: null #checkpoints/waypoint_1_vae_owlc_depth_c32_enc_distill/step_25000.pt
+
+  teacher_ckpt: checkpoints/waypoint_1_vae_owlc_f16_c16/step_300000.pt
+  teacher_cfg: configs/waypoint_1/owl_vae_f16_c16.yml
+
+  sample_interval: 1000
+  save_interval: 5000
+
+  latent_scale: 1.0
+  latent_shift: 0.0
+
+wandb:
+  name: shahbuland
+  project: new_vaes_v2
+  run_name: waypoint_1_vae_owlc_f16_c16_enc_distill_highlr

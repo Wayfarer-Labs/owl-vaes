@@ -46,4 +46,7 @@ def get_model_cls(model_id: str) -> Any:
     if model_id == "video_dcae":
         from .video_dcae import VideoDCAE
         return VideoDCAE
+    if model_id == "dito":
+        from .dito import DiTo
+        return DiTo
     return None

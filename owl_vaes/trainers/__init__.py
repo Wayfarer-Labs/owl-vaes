@@ -66,5 +66,8 @@ def get_trainer_cls(trainer_id: Literal["rec", "proxy", "audio_rec"]):
         case "video_rec":
             from .video_rec import VideoRecTrainer
             return VideoRecTrainer
+        case "dito":
+            from .dito import DiToTrainer
+            return DiToTrainer
         case _:
             raise NotImplementedError
