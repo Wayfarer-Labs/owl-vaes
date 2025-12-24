@@ -214,18 +214,21 @@ class RandomRGBDataset(IterableDataset):
     Assumes frames share a common resolution so default collate can stack.
     If window_length > 1, yields [window_length, C, H, W] tensors.
     """
-    def __init__(self, source, seed: int = 0, target_size = (360, 640), window_length = 1):
+    def __init__(self, source, seed: int = 0, target_size = (360, 640), window_length = 1, rank: int = 0, world_size: int = 1):
         super().__init__()
         self.source = source
         self.seed = int(seed)
         self.target_size = target_size
         self.window_length = window_length
+        self.rank = rank
+        self.world_size = world_size
 
     def __iter__(self):
         info = get_worker_info()
         wid = info.id if info else 0
         # Derive a per-worker seed (works with persistent workers)
-        wseed = (torch.initial_seed() + self.seed + wid) % (2**32)
+        # Incorporate rank to ensure different data across nodes
+        wseed = (torch.initial_seed() + self.seed + wid + self.rank * 10000) % (2**32)
         rng = RandomRGBFromMP4s(self.source, seed=int(wseed), target_size = self.target_size, window_length = self.window_length)
         for rgb in rng:
             # HWC uint8 -> CHW uint8 (or THWC -> TCHW for windows)
@@ -237,9 +240,12 @@ class RandomRGBDataset(IterableDataset):
                 # Window: [T, H, W, C] -> [T, C, H, W]
                 yield torch.from_numpy(rgb).permute(0, 3, 1, 2).contiguous().clone().bfloat16() / 127.5 - 1.0
 
-def get_loader(batch_size, **data_kwargs):
+def get_loader(batch_size, rank=0, world_size=1, **data_kwargs):
     if "seed" not in data_kwargs:
         data_kwargs["seed"] = 123
+    # Add rank and world_size to ensure distributed training works correctly
+    data_kwargs["rank"] = rank
+    data_kwargs["world_size"] = world_size
     ds = RandomRGBDataset(**data_kwargs)
     return DataLoader(
         ds,

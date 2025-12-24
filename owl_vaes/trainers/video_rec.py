@@ -129,7 +129,7 @@ class VideoRecTrainer(BaseTrainer):
             wandb.watch(self.get_module(), log = 'all')
 
         # Dataset setup
-        loader = get_loader(self.train_cfg.data_id, self.train_cfg.batch_size, **self.train_cfg.data_kwargs)
+        loader = get_loader(self.train_cfg.data_id, self.train_cfg.batch_size, rank=self.rank, world_size=self.world_size, **self.train_cfg.data_kwargs)
 
         local_step = 0
 
