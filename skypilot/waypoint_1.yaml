@@ -4,7 +4,7 @@ resources:
   cloud: kubernetes
   accelerators: H200:8
   
-num_nodes: 4
+num_nodes: 2
 
 setup: |
   sudo apt-get update
@@ -26,4 +26,4 @@ run: |
     --master_addr=$MASTER_ADDR \
     --node_rank=${SKYPILOT_NODE_RANK} \
     --master_port=8008 \
-    train.py --config_path configs/waypoint_1/base.yml
+    train.py --config_path configs/waypoint_1/temporal.yml
