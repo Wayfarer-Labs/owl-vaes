@@ -3,7 +3,6 @@ from torch import Tensor
 
 import einops
 
-@torch.compile(mode="max-autotune")
 def latent_reg_loss(z: Tensor, logvar: Tensor = None, target_var: float = 0.1) -> Tensor:
     """
     Latent regularization loss - Compiled for performance. (Fake KL)

@@ -1,5 +1,5 @@
 """
-Audio Reconstruction Trainer for Audio AutoEncoder - Optimized with torch.compile
+Audio Reconstruction Trainer for Audio AutoEncoder
 """
 
 import einops
@@ -30,8 +30,6 @@ from ..losses.basic import (
     latent_reg_loss
 )
 
-from ..nn.crt import CRT
-
 def compute_losses(
     batch_rec: Tensor,
     batch: Tensor,
@@ -45,7 +43,7 @@ def compute_losses(
     n_fft_list: list[int],
 ):
     """
-    Compiled loss computation function
+    Combined loss computation function
     """
     total_loss = torch.tensor(0.0, device=batch.device)
     metrics = {}
@@ -63,14 +61,14 @@ def compute_losses(
         metrics["stft_loss"] = stft_l
 
     # M/S loss for stereo audio
-    if lr_ms_ratio < 1.0 and batch.size(1) == 2:
+    if lr_ms_ratio < 1.0 and batch.size(-1) == 2:
         ms_loss = compute_ms_loss(batch_rec, batch) / accum_steps
         ms_weight = (1.0 + lr_ms_ratio) / 2.0
         total_loss = total_loss + ms_loss * ms_weight * recon_weight
         metrics["ms_loss"] = ms_loss
 
     # KL loss
-    if kl_weight > 0 and z is not None:
+    if kl_weight > 0 and z is not None and logvar is not None:
         kl_loss = latent_reg_loss(z,logvar) / accum_steps
         total_loss = total_loss + kl_loss * kl_weight
         metrics["kl_loss"] = kl_loss
@@ -134,14 +132,7 @@ class AudioRecTrainer(BaseTrainer):
         self.scheduler = None
         self.scaler = None
 
-        self.crt = CRT(self.model_cfg.latent_channels)
-        self.crt_opt = None
-        
         self.total_step_counter = 0
-
-    def _compile_model(self, model: nn.Module) -> nn.Module:
-        print("Compiling model...")
-        return torch.compile(model, mode="max-autotune-no-cudagraphs", dynamic=True)  # type: ignore
 
     def save(self):
         # Save the original model state, not the compiled one
@@ -152,15 +143,13 @@ class AudioRecTrainer(BaseTrainer):
             "scheduler": self.scheduler.state_dict(),
             "scaler": self.scaler.state_dict(),
             "steps": self.total_step_counter,
-            "crt": self.crt.state_dict(),
-            "crt_opt": self.crt_opt.state_dict()
         }
         super().save(save_dict)
 
     def load(self):
         if not hasattr(self.train_cfg, 'resume_ckpt') or self.train_cfg.resume_ckpt is None:
             return
-        
+
         save_dict = super().load(self.train_cfg.resume_ckpt)
         self.model.load_state_dict(save_dict["model"])
         self.ema.load_state_dict(save_dict["ema"])
@@ -168,20 +157,15 @@ class AudioRecTrainer(BaseTrainer):
         self.scheduler.load_state_dict(save_dict["scheduler"])
         self.scaler.load_state_dict(save_dict["scaler"])
         self.total_step_counter = save_dict["steps"]
-        self.crt.load_state_dict(save_dict["crt"])
-        self.crt_opt.load_state_dict(save_dict["crt_opt"])
 
     def train(self):
         # Loss weights
         recon_weight = self.train_cfg.loss_weights.get("recon", 1.0)
         stft_weight = self.train_cfg.loss_weights.get("stft", 1.0)
-        hubert_weight = self.train_cfg.loss_weights.get("hubert", 0.0)  # Placeholder
         kl_weight = self.train_cfg.loss_weights.get("kl", 1e-4)
         lr_ms_ratio = self.train_cfg.loss_weights.get(
             "lr_ms_ratio", 0.5
         )  # L/R weight relative to M/S
-        eq_weight = self.train_cfg.loss_weights.get('eq', 0.25)
-        crt_weight = self.train_cfg.loss_weights.get('crt', 4.0)
 
         # Audio-specific config
         sample_rate = getattr(self.train_cfg, "sample_rate", 44100)
@@ -189,14 +173,9 @@ class AudioRecTrainer(BaseTrainer):
 
         # Prepare model and EMA
         self.model = self.model.to(self.device).train()
-        self.crt = self.crt.to(self.device).train()
 
         if self.world_size > 1:
             self.model = DDP(self.model)
-            self.crt = DDP(self.crt)
-
-        # Compile model after DDP setup
-        #self.model = self._compile_model(self.model)
 
         self.ema = EMA(self.model, beta=0.9999, update_after_step=0, update_every=1)
 
@@ -212,13 +191,6 @@ class AudioRecTrainer(BaseTrainer):
             self.opt = getattr(torch.optim, self.train_cfg.opt)(
                 self.model.parameters(), **self.train_cfg.opt_kwargs
             )
-        
-        self.crt_opt = torch.optim.AdamW(
-            self.crt.parameters(),
-            lr=1e-4,
-            betas=(0.9, 0.95),
-            weight_decay=1e-4
-        )
 
         if self.train_cfg.scheduler is not None:
             self.scheduler = get_scheduler_cls(self.train_cfg.scheduler)(
@@ -263,51 +235,13 @@ class AudioRecTrainer(BaseTrainer):
                 n_fft_list=n_fft_list,
             )
 
-        def warmup_crt_weight():
-            if self.total_step_counter >= 1000:
-                return crt_weight
-            progress = self.total_step_counter / 1000
-            progress = min(1.0, max(0.0, progress))
-            return crt_weight * (1 - np.cos(progress * np.pi)) / 2
-
         for epoch_idx in range(self.train_cfg.epochs):
             for batch in loader:
                 batch = batch.to(self.device, dtype=torch.bfloat16)
 
-                #if batch.is_cuda:
-                #    torch.compiler.cudagraph_mark_step_begin()
-
                 with ctx:
-                    # Forward pass using compiled function
-                    output = self.model(batch)
-                    if len(output) == 4:
-                        batch_rec, z, logvar, (rec_1, rec_2) = output
-                    else:
-                        batch_rec, z, logvar = output
-
+                    batch_rec, z, logvar = self.model(batch)
                     total_loss, loss_metrics = loss_fn(batch_rec, batch, z, logvar)
-                    if eq_weight > 0.0:
-                        third_samples = batch.shape[-1] // 3
-                        target_1 = batch[:,:,:third_samples*2]
-                        target_2 = batch[:,:,third_samples:]
-
-                        eq_loss_1, _ = loss_fn(rec_1, target_1)
-                        eq_loss_2, _ = loss_fn(rec_2, target_2)
-                        eq_loss = 0.5 * (eq_loss_1 + eq_loss_2)
-                        metrics.log("eq_loss", eq_loss)
-                        total_loss += eq_loss * eq_weight
-
-                # CRT
-                unfreeze(self.crt)
-                with ctx:
-                    crt_loss_local = self.crt(z.detach().transpose(1,2)) / accum_steps
-                self.scaler.scale(crt_loss_local).backward()
-                freeze(self.crt)
-
-                with ctx:
-                    crt_loss = self.crt(z.transpose(1,2)) / accum_steps
-                    total_loss += warmup_crt_weight() * crt_loss
-                    metrics.log('crt_loss', crt_loss)
 
                 # Update metrics
                 metrics.log_dict(loss_metrics)
@@ -317,24 +251,18 @@ class AudioRecTrainer(BaseTrainer):
 
                 local_step += 1
                 if local_step % accum_steps == 0:
-                    # Optimization step using compiled function
+                    # Optimization step
                     self.scaler.unscale_(self.opt)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    
-                    self.scaler.unscale_(self.crt_opt)
-                    torch.nn.utils.clip_grad_norm_(self.crt.parameters(), max_norm=1.0)
 
                     self.scaler.step(self.opt)
-                    self.scaler.step(self.crt_opt)
                     self.opt.zero_grad(set_to_none=True)
-                    self.crt_opt.zero_grad(set_to_none=True)
 
                     self.scaler.update()
 
                     if self.scheduler is not None:
                         self.scheduler.step()
 
-                    # EMA update (not compiled as it has its own optimized implementation)
                     self.ema.update()
 
                     with torch.no_grad():
@@ -352,7 +280,7 @@ class AudioRecTrainer(BaseTrainer):
                                 batch.detach().contiguous().float(),
                                 batch_rec.detach().contiguous().float(),
                                 sample_rate=sample_rate,
-                                max_samples=2,
+                                max_samples=4,
                             )
                             wandb_dict.update(audio_logs)
 

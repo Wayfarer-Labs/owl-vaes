@@ -1,0 +1,70 @@
+model:
+  model_id: causal_audio
+
+  n_layers: 24
+  n_heads: 16
+  d_model: 1024
+
+  rope_impl: simple
+  
+  latent_tokens: 120
+  patch_size: 25
+  n_samples: 22050
+  latent_samples: 120
+
+  latent_channels: 64
+
+  causal: false
+  skip_logvar: false
+
+
+
+train:
+  trainer_id: audio_rec
+  data_id: video_dir_audio_loader
+  data_kwargs:
+    source:
+     - /mnt/data/datasets/extracted_tars/kbm/fps/*/*.mp4
+     - /mnt/data/datasets/extracted_tars/kbm/3ps/*/*.mp4
+     - /mnt/data/datasets/extracted_tars/kbm/other/*/*.mp4
+    target_sampling_rate: 44100
+    target_window_length: 22050 # 0.5 second at 44.1kHz
+
+  target_batch_size: 256
+  batch_size: 32
+
+  epochs: 200
+
+  opt: AdamW
+  opt_kwargs:
+    lr: 1.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.95]
+    eps: 1.0e-15
+
+  # Audio-specific parameters
+  sample_rate: 44100
+  n_fft_list: [1024, 2048, 512, 256, 128, 64, 32]
+
+  # Audio loss weights
+  loss_weights:
+    recon: 1.0
+    stft: 1.0
+    kl: 1.0e-6
+    lr_ms_ratio: 0.5  # L/R weight relative to M/S
+
+  scheduler: LinearWarmup
+  scheduler_kwargs:
+    warmup_steps: 3000
+    min_lr: 1.0e-5
+
+  checkpoint_dir: checkpoints/waypoint_1_audio_basic
+  resume_ckpt: null
+
+  sample_interval: 500
+  save_interval: 5000
+
+wandb:
+  name: wayfarerlabs
+  project: owl_audio_vaes
+  run_name: waypoint_1_audio_basic

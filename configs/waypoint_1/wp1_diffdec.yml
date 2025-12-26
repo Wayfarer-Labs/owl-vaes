@@ -1,0 +1,80 @@
+model:
+  model_id: diff_dec
+  sample_size: [45, 80]
+  channels: 16
+  latent_size: 16
+  latent_channels: 64
+  patch_size: [5,2]
+
+  n_layers: 28
+  n_heads: 24
+  d_model: 1536
+
+  causal: false
+  mimetic_init: false
+  block_size: null
+  backbone: dit
+  rope_impl: image+latent
+  dropout: 0.1
+  shuffle_factor: 1
+  cfg_prob: 0.1
+
+train:
+  trainer_id: proxy_diffdec
+  data_id: video_dir_loader
+  data_kwargs:
+    source: 
+     - /mnt/data/waypoint_1/data/MKIF/*/*.mp4
+    target_size: [360, 640]
+
+  target_batch_size: 128
+  batch_size: 16
+
+  epochs: 200
+
+ # opt: AdamW
+ # opt_kwargs:
+ #   lr: 1.0e-4
+ #   weight_decay: 1.0e-4
+ #   betas: [0.9, 0.95]
+ #   eps: 1.0e-15
+
+  opt: Muon
+  opt_kwargs:
+    lr: 1.0e-2
+    momentum: 0.95
+    adamw_lr: 1.0e-4
+    adamw_wd: 1.0e-4
+    adamw_eps: 1.0e-6
+    adamw_betas: [0.9, 0.95]
+    adamw_keys:
+      - core.proj_in
+      - core.proj_in_z
+      - core.proj_out
+      - core.ts_embed
+      - core.final
+      - core.null_emb
+      - .adaln1
+      - .adaln2
+      - .gate1
+      - .gate2
+
+
+  checkpoint_dir: checkpoints/wp1_720p_diffdec
+  resume_ckpt: null # checkpoints/wp1_720p_dec_distill/step_10000.pt
+
+  sample_interval: 100
+  save_interval: 5000
+
+  teacher_cfg: configs/waypoint_1/wp1_depth.yml
+  teacher_ckpt: checkpoints/waypoint_1_vae_owlc_depth/step_390000.pt
+
+  latent_scale: 0.69
+  ldm_scale: 1.0
+  sampling_steps: 20
+  cfg_scale: 1.5
+
+wandb:
+  name: wayfarerlabs
+  project: hd_vaes
+  run_name: wp1_720p_diffdec

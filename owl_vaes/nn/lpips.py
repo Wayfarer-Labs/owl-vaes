@@ -42,7 +42,7 @@ class VGGLPIPS(nn.Module):
 def is_landscape(h,w):
     return w > h
 
-def landscape_patchify(x):
+def landscape_patchify_360p(x):
     # Experimental
     x = F.interpolate(x, (360, 640), mode='bicubic')
 
@@ -61,6 +61,24 @@ def landscape_patchify(x):
         patch_bm,
         patch_br,
     ], dim=0)
+
+def landscape_patchify_720p(x):
+    tl_patches = landscape_patchify_360p(x[:,:,:360,:360])
+    tr_patches = landscape_patchify_360p(x[:,:,:360,-360:])
+    bl_patches = landscape_patchify_360p(x[:,:,-360:,:360])
+    br_patches = landscape_patchify_360p(x[:,:,-360:,-360:])
+    return torch.cat([tl_patches, tr_patches, bl_patches, br_patches], dim=0)
+
+def landscape_patchify(x):
+    _, _, h, w = x.shape
+    if h == 180 and w == 320:
+        return landscape_patchify_360p(x)
+    if h == 360 and w == 640:
+        return landscape_patchify_360p(x)
+    elif h == 720 and w == 1280:
+        return landscape_patchify_720p(x)
+    else:
+        raise ValueError(f"Unsupported image size: {h}x{w}")
 
 def cn_patchify(x):
     _, _, h, w = x.shape

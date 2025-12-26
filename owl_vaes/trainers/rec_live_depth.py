@@ -176,8 +176,7 @@ class RecLiveDepthTrainer(BaseTrainer):
                         metrics.log('l2_loss', l2_loss)
 
                     if dwt_weight > 0.0:
-                        with ctx:
-                            dwt_loss = dwt_loss_fn(batch_rec[:,:3], batch[:,:3]) / accum_steps
+                        dwt_loss = dwt_loss_fn(batch_rec[:,:3], batch[:,:3]) / accum_steps
                         total_loss += dwt_loss * dwt_weight
                         metrics.log('dwt_loss', dwt_loss)
 
@@ -199,8 +198,10 @@ class RecLiveDepthTrainer(BaseTrainer):
                 local_step += 1
                 if local_step % accum_steps == 0:
                     # Updates
-                    self.scaler.unscale_(self.opt)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+                    if self.train_cfg.opt.lower() != "muon":
+                        self.scaler.unscale_(self.opt)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+
                     self.scaler.step(self.opt)
                     self.opt.zero_grad(set_to_none=True)
 

@@ -2,7 +2,8 @@ import einops as eo
 import torch
 import torch.nn.functional as F
 from torch import nn
-#from torch.nn.attention.flex_attention import flex_attention
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+import einops as eo
 
 from owl_vaes.configs import TransformerConfig
 
@@ -10,15 +11,116 @@ from .mimetic import mimetic_init
 from .mlp import MLP
 from .normalization import LayerNorm, QKNorm
 from .rope import get_rope_impl
-
+from ..utils import int_to_tuple
 
 torch.backends.cuda.enable_flash_sdp(enabled=True)
-#flex_attention = torch.compile(flex_attention)
+flex_attention = torch.compile(flex_attention)
 
 from einops._torch_specific import allow_ops_in_compiled_graph
 allow_ops_in_compiled_graph()
 
+def get_attn_mask(
+    config,
+    cache_frame_offset = 0,
+    batch_size = None,
+    device = None,
+    max_q_len = 1024,
+    max_kv_len = 1024,
+    kernel_size = None,
+):
+    """
+    This will assume combined latents
+    """
+    h,w = int_to_tuple(config.sample_size)
+    p_y, p_x = int_to_tuple(config.patch_size)
+    if kernel_size is not None:
+        k_y, k_x = int_to_tuple(kernel_size)
+
+    n_frames = getattr(config, "n_frames", 1)
+    n_p_y = h // p_y
+    n_p_x = w // p_x
+    n_p_y_rope = n_p_y + config.latent_size
+    n_p_x_rope = n_p_x + config.latent_size
+    n_video = n_frames * n_p_y * n_p_x
+    n_latent = config.latent_size ** 2 * n_frames
+
+    def is_latent(idx):
+        return idx >= n_video
+    
+    def is_video(idx):
+        return idx < n_video
+
+    def frame_idx(idx):
+        video_result = idx // (n_p_y * n_p_x)
+        shift_idx = idx - n_video
+        latent_result = shift_idx // (config.latent_size ** 2)
+        return torch.where(is_video(idx), video_result, latent_result)
+        
+    def row_idx(idx):
+        # Latent case
+        shift_idx = idx - n_video
+        in_frame_idx_latent = shift_idx % (config.latent_size ** 2)
+        latent_result = in_frame_idx_latent // config.latent_size
+
+        # Video case
+        in_frame_idx_video = idx % (n_p_y * n_p_x)
+        video_result = in_frame_idx_video // n_p_x
+
+        return torch.where(is_latent(idx), latent_result, video_result)
+    
+    def col_idx(idx):
+        # Latent case
+        shift_idx = idx - n_video
+        in_frame_idx_latent = shift_idx % (config.latent_size ** 2)
+        latent_result = in_frame_idx_latent % config.latent_size
+
+        # Video case
+        in_frame_idx_video = idx % (n_p_y * n_p_x)
+        video_result = in_frame_idx_video % n_p_x
+
+        return torch.where(is_latent(idx), latent_result, video_result)
+        
+    def can_attend_to(b,h,idx_i, idx_j):
+        frame_idx_i = frame_idx(idx_i)
+        row_idx_i = row_idx(idx_i)
+        col_idx_i = col_idx(idx_i)
+
+        frame_idx_j = frame_idx(idx_j)
+        row_idx_j = row_idx(idx_j)
+        col_idx_j = col_idx(idx_j)
+
+        if kernel_size is None:
+            return frame_idx_j <= frame_idx_i
+        else:
+            causal_mask = (frame_idx_j <= frame_idx_i)
+
+            # If i is image, it can attend to images in neighbourhood
+            image_nbr_mask = (torch.abs(row_idx_j - row_idx_i) <= k_y) & (torch.abs(col_idx_j - col_idx_i) <= k_x)
+            
+            # If i is latent, it can attend to any other latent in its frame
+            # It can't attend to any image tokens
+            # If i is image, it can attend to any latent tokens or image tokens in neighbourhood
+            nbr_mask = torch.where(
+                is_latent(idx_i),
+                is_latent(idx_j),
+                is_latent(idx_j) | image_nbr_mask
+            )
+
+            return causal_mask & nbr_mask
+    
+    return create_block_mask(
+        can_attend_to,
+        B=batch_size,
+        H=config.n_heads,
+        Q_LEN=max_q_len,
+        KV_LEN=max_kv_len,
+        device=device,
+    )
+
 class Attn(nn.Module):
+    """
+    Causal attention for causal diffusion decoder
+    """
     def __init__(self, config : TransformerConfig):
         super().__init__()
 
@@ -28,124 +130,30 @@ class Attn(nn.Module):
         self.out = nn.Linear(config.d_model, config.d_model, bias = False)
 
         self.qk_norm = QKNorm(config.d_model // config.n_heads)
-        rope_impl = getattr(config, "rope_impl", None)
-        if rope_impl is None:
-            self.rope = None
-        else:
-            self.rope = get_rope_impl(rope_impl)(config.d_model, config.n_heads)
-        self.causal = config.causal
+        self.rope = get_rope_impl(config.rope_impl)(config)
 
         self.layer_ind = None
-
         nn.init.zeros_(self.out.weight)
-
-    def forward(self, x, kv_cache = None, tread_mask = None):
+    
+    def forward(self, x, kv_cache = None, attn_mask = None):
         # x: [b, n, d_model]
-        b, n, d_model = x.shape
-        h = self.n_heads
-        d = d_model // h
 
         # Linear projection and split into q, k, v
         qkv = self.qkv(x)  # [b, n, 3 * d_model]
-        qkv = qkv.view(b, n, 3, h, d)  # [b, n, 3, h, d]
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, b, h, n, d]
-        q, k, v = qkv[0], qkv[1], qkv[2]  # each [b, h, n, d]
+        q,k,v = eo.rearrange(qkv, 'b n (three h d) -> three b h n d', h = self.n_heads, three = 3)
 
         q, k = self.qk_norm(q, k)
         if self.rope is not None:
-            q, k = self.rope(q, k, tread_mask)
-        x_out = F.scaled_dot_product_attention(q, k, v, is_causal = self.causal)
-        #x_out = flex_attention(q,k,v)
-        x_out = x_out.to(x.dtype)
+            q, k = self.rope(q, k)
+        q = q.to(v.dtype)
+        k = k.to(v.dtype)
 
-        # Rearrange from [b, h, n, d] -> [b, n, h * d]
-        x_out = x_out.permute(0, 2, 1, 3).contiguous().view(b, n, h * d)
+        x_out = flex_attention(q,k,v,block_mask=attn_mask)
+
+        x_out = eo.rearrange(x_out, 'b h n d -> b n (h d)')
         x_out = self.out(x_out)
         return x_out
 
-class CosSimAttn(nn.Module):
-    def __init__(self, config : TransformerConfig):
-        super().__init__()
-
-        self.n_heads = config.n_heads
-
-        self.qkv = nn.Linear(config.d_model, 3 * config.d_model)
-        self.out = nn.Linear(config.d_model, config.d_model)
-
-        self.qk_norm = QKNorm(config.d_model // config.n_heads)
-        self.rope = ImageRoPEWithLatent(config) if config.rope_impl == "image+latent" else ImageRoPE(config)
-        self.causal = config.causal
-
-        self.layer_ind = None
-
-    def forward(self, x, kv_cache = None):
-        # x: [b, n, d_model]
-        b, n, d_model = x.shape
-        h = self.n_heads
-        d = d_model // h
-
-        # Linear projection and split into q, k, v
-        qkv = self.qkv(x)  # [b, n, 3 * d_model]
-        qkv = qkv.view(b, n, 3, h, d)  # [b, n, 3, h, d]
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, b, h, n, d]
-        q, k, v = qkv[0], qkv[1], qkv[2]  # each [b, h, n, d]
-
-        q, k = self.qk_norm(q, k)
-        q, k = self.rope(q, k)
-        x_out = flash_cosine_sim_attention(q, k, v, causal = False)
-        x_out = x_out.to(x.dtype)
-
-        # Rearrange from [b, h, n, d] -> [b, n, h * d]
-        x_out = x_out.permute(0, 2, 1, 3).contiguous().view(b, n, h * d)
-        x_out = self.out(x_out)
-        return x_out
-
-class MMAttn(nn.Module):
-    """
-    MMDiT style attention
-    """
-    def __init__(self, config : TransformerConfig):
-        super().__init__()
-
-        self.n_heads = config.n_heads
-
-        self.qkv_1 = nn.Linear(config.d_model, 3 * config.d_model)
-        self.qkv_2 = nn.Linear(config.d_model, 3 * config.d_model)
-
-        self.out_1 = nn.Linear(config.d_model, config.d_model)
-        self.out_2 = nn.Linear(config.d_model, config.d_model)
-
-        self.qk_norm_1 = QKNorm(config.d_model // config.n_heads)
-        self.qk_norm_2 = QKNorm(config.d_model // config.n_heads)
-
-    def split(self, qkv):
-        return eo.rearrange(qkv, 'b n (three h d) -> three b h n d', three = 3, h = self.n_heads)
-
-    def merge(self, x):
-        return eo.rearrange(x, 'b h n d -> b n (h d)')
-
-    def forward(self, x_1, x_2):
-        n1 = x_1.shape[1]
-
-        q1,k1,v1 = self.split(self.qkv_1(x_1))
-        q2,k2,v2 = self.split(self.qkv_2(x_2))
-
-        q1,k1 = self.qk_norm_1(q1,k1)
-        q2,k2 = self.qk_norm_2(q2,k2)
-
-        q = torch.cat([q1,q2],dim=-2)
-        k = torch.cat([k1,k2],dim=-2)
-        v = torch.cat([v1,v2],dim=-2)
-
-        x = F.scaled_dot_product_attention(q,k,v)
-        x = self.merge(x)
-        
-        x_1, x_2 = x[:,:n1], x[:,n1:]
-        x_1 = self.out_1(x_1)
-        x_2 = self.out_2(x_2)
-
-        return x_1, x_2
-        
 class Transformer(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -158,10 +166,10 @@ class Transformer(nn.Module):
         self.attn = Attn(config)
         self.mlp = MLP(config)
 
-    def forward(self, x, kv_cache = None):
+    def forward(self, x, kv_cache = None, attn_mask = None):
         res1 = x.clone()
         x = self.norm1(x)
-        x = self.attn(x, kv_cache)
+        x = self.attn(x, kv_cache, attn_mask)
         x = res1 + x
 
         res2 = x.clone()
@@ -181,9 +189,9 @@ class StackedTransformer(nn.Module):
             blocks[i].attn.layer_ind = i
         self.blocks = nn.ModuleList(blocks)
 
-    def forward(self, x, kv_cache = None):
+    def forward(self, x, kv_cache = None, attn_mask = None):
         for block in self.blocks:
-            x = block(x, kv_cache)
+            x = block(x, kv_cache, attn_mask)
 
         return x
 
@@ -220,44 +228,6 @@ class PatchProjOut(nn.Module):
         x = eo.rearrange(x, 'b (h w) (ph pw c) -> b c (h ph) (w pw)', h = self.n_patches, ph = self.patch_size, pw = self.patch_size)
 
         return x
-
-class TemporalAttn(nn.Module):
-    def __init__(self, d_model, n_heads, n_frames, layer_ind = None):
-        super().__init__()
-
-        self.n_frames = n_frames
-        self.qkv = nn.Linear(d_model, 3 * d_model)
-        self.qk_norm = QKNorm(d_model // n_heads)
-        self.rope = get_rope_impl("simple")(d_model, n_heads)
-        self.layer_ind = layer_ind
-
-    def forward(self, x, kv_cache = None):
-        # x is [b*n, c, h, w]
-        bn,c,h,w = x.shape
-        b = bn//self.n_frames
-
-        x = x.view(b, self.n_frames, c, h, w)
-        x = x.permute(0,3,4,1,2).view(b*h*w,self.n_frames,c)
-        # bhw,n,c
-
-        qkv = self.qkv(x)
-        qkv = qkv.view(b*h*w, self.n_frames, 3, n_heads, c//n_heads)
-        qkv = qkv.permute(2,0,3,1,4) # 3,bhw,n_heads,n_frames,d_model//n_heads
-        q,k,v = qkv[0], qkv[1], qkv[2]
-
-        q,k = self.qk_norm(q,k)
-        q,k = self.rope(q,k)
-
-        x = flex_attention(q,k,v,is_causal=True)
-        x = x.view(b,h,w,self.n_frames,c)
-        x = x.permute(0,3,4,1,2)
-        x = x.view(b*self.n_frames,c,h,w)
-
-        return x
-
-# ===== Conv ATTN =====
-
-# TODO, replace my own deleted code
 
 def attn_test():
     cfg = TransformerConfig(

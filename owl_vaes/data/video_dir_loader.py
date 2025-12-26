@@ -16,18 +16,19 @@ class RandomRGBFromMP4s:
     - No persistent handles: each yield opens the chosen file once and closes it.
     - Duration/fps are computed lazily on first use and cached in memory.
     """
-    def __init__(self, source, seed=None, target_size=(360,640)):
+    def __init__(self, source, seed=None, target_size=(360,640), window_length=1):
         # Ensure source is a list
         if isinstance(source, str):
             source = [source]
         self.target_size = target_size  # (H, W)
+        self.window_length = window_length
         # 1. Collect all .mp4 files (can be glob, dir, list, …)
         self.paths = self._find_mp4s(source)
 
         if not self.paths:
             raise RuntimeError("No videos found in the supplied source.")
         self.rng = random.Random(seed)
-        self.meta = {}  # path -> (duration_s, eps_end_s)
+        self.meta = {}  # path -> (duration_s, fps, eps_end_s)
 
     @staticmethod
     def _find_mp4s(spec):
@@ -54,11 +55,13 @@ class RandomRGBFromMP4s:
         for attempt in range(max_attempts):
             try:
                 p = self.paths[self.rng.randrange(len(self.paths))]
-                # If we already know (dur, eps), use it; otherwise compute inside the same open.
+                # If we already know (dur, fps, eps), use it; otherwise compute inside the same open.
                 if p in self.meta:
-                    dur, eps = self.meta[p]
-                    t = self.rng.random() * max(0.0, dur - eps)
-                    frame = self._decode_at_time(p, t)
+                    dur, fps, eps = self.meta[p]
+                    # Leave enough space at the end for window_length frames
+                    max_t = max(0.0, dur - eps * self.window_length)
+                    t = self.rng.random() * max_t
+                    frames = self._decode_window_at_time(p, t, fps)
                 else:
                     # First time for this file: open once, read metadata, pick t, decode, close.
                     with av.open(str(p)) as c:
@@ -68,12 +71,16 @@ class RandomRGBFromMP4s:
                             (float(v.frames) / fps) if (v.frames and fps) else 600.0
                         )
                         eps = 1.0 / max(1.0, fps)
-                        self.meta[p] = (float(dur), float(eps))
-                        t = self.rng.random() * max(0.0, dur - eps)
-                        frame = self._decode_from_open(c, v, t)  # decode using this same open
+                        self.meta[p] = (float(dur), float(fps), float(eps))
+                        max_t = max(0.0, dur - eps * self.window_length)
+                        t = self.rng.random() * max_t
+                        frames = self._decode_window_from_open(c, v, t, fps)  # decode using this same open
 
-                # Resize frame if needed
-                return self._resize_if_needed(frame)
+                # Resize frames if needed and return
+                if self.window_length == 1:
+                    return self._resize_if_needed(frames[0])
+                else:
+                    return np.stack([self._resize_if_needed(f) for f in frames], axis=0)
 
             except Exception as e:
                 print(f"Error decoding {p}: {e}. Trying another video...")
@@ -146,37 +153,104 @@ class RandomRGBFromMP4s:
             v = next(s for s in c.streams if s.type == "video")
             return self._decode_from_open(c, v, t_sec)
 
+    def _decode_window_from_open(
+            self,
+            container: av.container.input.InputContainer,
+            vstream: av.video.stream.VideoStream,
+            t_sec: float,
+            fps: float
+    ) -> list:
+        """Decode window_length consecutive frames starting at t_sec; returns list of RGB24 (H,W,3)."""
+        tb: Fraction = vstream.time_base
+        # Light speed knobs
+        try:
+            vstream.thread_type = "FRAME"
+            vstream.codec_context.thread_count = 1
+            vstream.codec_context.skip_loop_filter = "ALL"
+        except Exception:
+            pass
+
+        # Clamp t to known duration if available
+        if container.duration is not None:
+            t_sec = min(max(0.0, t_sec), max(0.0, container.duration / 1e6 - 1e-3))
+
+        # Keyframe seek then decode forward to >= t
+        try:
+            vstream.codec_context.skip_frame = "NONKEY"
+            container.seek(int(max(0.0, t_sec) / float(tb)), stream=vstream, backward=True, any_frame=False)
+        finally:
+            vstream.codec_context.skip_frame = "DEFAULT"
+
+        frames = []
+        started = False
+
+        for pkt in container.demux(vstream):
+            for fr in pkt.decode():
+                # Check if we've reached the target time
+                if not started and fr.time is not None and fr.time + 1e-6 >= t_sec:
+                    started = True
+
+                if started:
+                    frames.append(fr.to_ndarray(format="rgb24"))
+                    if len(frames) >= self.window_length:
+                        return frames[:self.window_length]
+
+        # If we didn't get enough frames, raise an error to trigger retry
+        if len(frames) < self.window_length:
+            raise RuntimeError(f"Could not decode {self.window_length} frames, only got {len(frames)}")
+
+        return frames[:self.window_length]
+
+    def _decode_window_at_time(self, path: Path, t_sec: float, fps: float) -> list:
+        """Open the file, decode window at t, close; returns list of RGB24 (H,W,3)."""
+        with av.open(str(path), options={"fflags": "fastseek+nobuffer"}) as c:
+            v = next(s for s in c.streams if s.type == "video")
+            return self._decode_window_from_open(c, v, t_sec, fps)
+
 
 class RandomRGBDataset(IterableDataset):
     """
     Infinite stream of CHW uint8 frames. One independent generator per worker.
     Assumes frames share a common resolution so default collate can stack.
+    If window_length > 1, yields [window_length, C, H, W] tensors.
     """
-    def __init__(self, source, seed: int = 0, target_size = (360, 640)):
+    def __init__(self, source, seed: int = 0, target_size = (360, 640), window_length = 1, rank: int = 0, world_size: int = 1):
         super().__init__()
         self.source = source
         self.seed = int(seed)
         self.target_size = target_size
+        self.window_length = window_length
+        self.rank = rank
+        self.world_size = world_size
 
     def __iter__(self):
         info = get_worker_info()
         wid = info.id if info else 0
         # Derive a per-worker seed (works with persistent workers)
-        wseed = (torch.initial_seed() + self.seed + wid) % (2**32)
-        rng = RandomRGBFromMP4s(self.source, seed=int(wseed), target_size = self.target_size)
+        # Incorporate rank to ensure different data across nodes
+        wseed = (torch.initial_seed() + self.seed + wid + self.rank * 10000) % (2**32)
+        rng = RandomRGBFromMP4s(self.source, seed=int(wseed), target_size = self.target_size, window_length = self.window_length)
         for rgb in rng:
-            # HWC uint8 -> CHW uint8; clone() gives the tensor its own
-            # resizable storage, preventing rare ‘resize_ not allowed’ errors.
-            yield torch.from_numpy(rgb).permute(2, 0, 1).contiguous().clone().bfloat16() / 127.5 - 1.0
+            # HWC uint8 -> CHW uint8 (or THWC -> TCHW for windows)
+            # clone() gives the tensor its own resizable storage, preventing rare 'resize_ not allowed' errors.
+            if self.window_length == 1:
+                # Single frame: [H, W, C] -> [C, H, W]
+                yield torch.from_numpy(rgb).permute(2, 0, 1).contiguous().clone().bfloat16() / 127.5 - 1.0
+            else:
+                # Window: [T, H, W, C] -> [T, C, H, W]
+                yield torch.from_numpy(rgb).permute(0, 3, 1, 2).contiguous().clone().bfloat16() / 127.5 - 1.0
 
-def get_loader(batch_size, **data_kwargs):
+def get_loader(batch_size, rank=0, world_size=1, **data_kwargs):
     if "seed" not in data_kwargs:
         data_kwargs["seed"] = 123
+    # Add rank and world_size to ensure distributed training works correctly
+    data_kwargs["rank"] = rank
+    data_kwargs["world_size"] = world_size
     ds = RandomRGBDataset(**data_kwargs)
     return DataLoader(
         ds,
         batch_size=batch_size,
-        num_workers=4,
+        num_workers=8,
         pin_memory=True,
         persistent_workers=True,
         prefetch_factor=2,
@@ -187,12 +261,40 @@ def get_loader(batch_size, **data_kwargs):
 
 if __name__ == "__main__":
     import time
-    loader = get_loader(32, source="/mnt/data/datasets/extracted_tars/kbm/fps/*/*.mp4", target_size = (360, 640))
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    loader = iter(loader)
-    for i in range(1000):
-        t0 = time.time()
-        batch_u8 = next(loader)
-        t1 = time.time()
-        print(f"Batch {i}: shape {tuple(batch_u8.shape)}, dtype {batch_u8.dtype}, load_time {t1-t0:.4f}s")
-        _ = (batch_u8.to(dev, non_blocking=True).float() / 255.0)  # example move/normalize
+    from PIL import Image
+
+    print("Testing window_length=120 on ./data")
+    loader = get_loader(
+        1,
+        source="./data",
+        target_size=(360, 640),
+        window_length=120
+    )
+
+    loader_iter = iter(loader)
+    t0 = time.time()
+    batch = next(loader_iter)
+    t1 = time.time()
+
+    print(f"Batch shape: {tuple(batch.shape)}, dtype: {batch.dtype}, load_time: {t1-t0:.4f}s")
+    print(f"Value range: [{batch.min().item():.3f}, {batch.max().item():.3f}]")
+
+    # Take first sample: [T, C, H, W]
+    sample = batch[0]  # [120, 3, 360, 640]
+
+    # Convert from [-1, 1] bfloat16 to [0, 255] uint8
+    sample = ((sample.float() + 1.0) * 127.5).clamp(0, 255).byte()
+
+    # Convert to [T, H, W, C] for PIL
+    sample = sample.permute(0, 2, 3, 1).cpu().numpy()  # [120, 360, 640, 3]
+
+    # Create PIL images and save as gif
+    frames = [Image.fromarray(frame) for frame in sample]
+    frames[0].save(
+        "test_window.gif",
+        save_all=True,
+        append_images=frames[1:],
+        duration=33,  # ~30 fps
+        loop=0
+    )
+    print("Saved test_window.gif")

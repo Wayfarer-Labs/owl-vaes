@@ -13,6 +13,8 @@ from ..nn.dit import DiT, FinalLayer
 
 from ..nn.embeddings import LearnedPosEnc
 from ..nn.embeddings import TimestepEmbedding, StepEmbedding
+from ..nn.attn import get_attn_mask
+from ..utils import int_to_tuple
 
 def is_landscape(sample_size):
     h,w = sample_size
@@ -41,34 +43,48 @@ class DiffusionDecoderCore(nn.Module):
         self.ts_embed = TimestepEmbedding(config.d_model)
         
         self.proj_in_z = nn.Linear(config.latent_channels, config.d_model)
-
-        self.rope_impl = getattr(config, "rope_impl", None)
-        if self.rope_impl is None:
-            raise ValueError("rope_impl must be set; learned positional encodings are no longer supported.")
-
         self.final = FinalLayer(config, skip_proj = True)
 
+        self.blocks = DiT(config)
+        self.config = config
+
+        self.shuffle_factor = getattr(config, "shuffle_factor", 1)
+        self.noise_scale = getattr(config, "noise_scale", 1.0)
         self.p_y, self.p_x = patch_size
         self.n_p_y = config.sample_size[0] // self.p_y
         self.n_p_x = config.sample_size[1] // self.p_x
 
-        if config.backbone == "dit":
-            self.blocks = DiT(config)
-        elif config.backbone == "hdit":
-            from ..nn.hdit import HDiT
-            self.blocks = HDiT(config)
-        self.config = config
+        # Learned null embedding for CFG
+        self.null_emb = nn.Parameter(torch.zeros(config.latent_channels, config.latent_size, config.latent_size))
 
-    def forward(self, x, z, ts):
+    def forward(self, x, z, ts, attn_mask = None):
         # x is [b,c,h,w]
         # z is [b,c,h,w] but different size cause latent
         # ts is [b,] in [0,1]
         # d is [b,] in [1,2,4,...,128]
+    
+        if attn_mask is None:
+            max_q = self.n_p_y * self.n_p_x
+            max_q += self.config.latent_size ** 2
+            max_kv = max_q
+
+            attn_mask = get_attn_mask(
+                self.config,
+                batch_size = x.shape[0],
+                device = x.device,
+                max_q_len = max_q,
+                max_kv_len = max_kv,
+                kernel_size = int_to_tuple(getattr(self.config, "kernel", None))
+            )
+
+        if self.shuffle_factor > 1:
+            x = F.pixel_unshuffle(x, self.shuffle_factor)
 
         cond = self.ts_embed(ts)
 
         # Convert from image format [b,c,h,w] to patches [b,n_patches,patch_size*patch_size*c]
         b, c, h, w = x.shape
+
         x = x.view(b, c, self.n_p_y, self.p_y, self.n_p_x, self.p_x)
         x = x.permute(0, 2, 4, 3, 5, 1).contiguous()
         x = x.view(b, self.n_p_y * self.n_p_x, self.p_y * self.p_x * c)
@@ -97,6 +113,9 @@ class DiffusionDecoderCore(nn.Module):
         x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
         x = x.view(b, c, self.n_p_y * self.p_y, self.n_p_x * self.p_x).contiguous()
 
+        if self.shuffle_factor > 1:
+            x = F.pixel_shuffle(x, self.shuffle_factor)
+
         return x
 
 class DiffusionDecoder(nn.Module):
@@ -107,6 +126,13 @@ class DiffusionDecoder(nn.Module):
 
         self.ts_mu = 0.4
         self.ts_sigma = 1.0
+        self.cfg_prob = getattr(config, "cfg_prob", 0.0)
+        self.x0_mode = getattr(config, "x0_mode", False)
+        self.noise_scale = getattr(config, "noise_scale", 1.0)
+
+        if self.x0_mode:
+            self.ts_mu = -0.8
+            self.ts_sigma = 0.8
 
     @torch.no_grad()
     def sample_timesteps(self, b, device, dtype):
@@ -120,26 +146,52 @@ class DiffusionDecoder(nn.Module):
         with torch.no_grad():
             ts = self.sample_timesteps(len(x), x.device, x.dtype)
 
-            eps = torch.randn_like(x)
+            eps = torch.randn_like(x) * self.noise_scale
             ts_exp = ts.view(-1, 1, 1, 1).expand_as(x)
 
-            lerpd = x * (1. - ts_exp) + ts_exp * eps
-            target = eps - x
+            if self.x0_mode:
+                lerpd = ts_exp * x + (1. - ts_exp) * eps
+            else:
+                lerpd = x * (1. - ts_exp) + ts_exp * eps
+
+            if self.x0_mode:
+                den = (1. - ts_exp).clamp(min=0.05)
+                target = (x - lerpd) / den
+            else:
+                target = eps - x
+
+            # Apply CFG dropout: replace z with null embedding with probability cfg_prob
+            if self.cfg_prob > 0:
+                mask = torch.rand(len(z), device=z.device) < self.cfg_prob
+                z = z.clone()
+                z[mask] = self.core.null_emb.unsqueeze(0)
 
         pred = self.core(lerpd, z, ts)
+        if self.x0_mode:
+            pred = (pred - lerpd) / den
         diff_loss = F.mse_loss(pred, target)
 
         return diff_loss
 
-
 if __name__ == "__main__":
     from ..configs import Config
+    import torch
+    import torch.nn.functional as F
 
-    cfg = Config.from_yaml("configs/cod_yt_v2/causal_diffdec.yml").model
-    model = DiffusionDecoderCore(cfg).bfloat16().cuda()
-    x = torch.randn(1,3,360,640).bfloat16().cuda()
-    z = torch.randn(1,128,8,8).bfloat16().cuda()
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+
+    cfg = Config.from_yaml("configs/waypoint_1/wp1_diffdec.yml").model
+
+    from diffusers import AutoencoderTiny
+    vae = AutoencoderTiny.from_pretrained("madebyollin/taef1")
+    vae = vae.float().to(device)  # bfloat16 not supported on mps
+
+    model = DiffusionDecoderCore(cfg).float().to(device)
+    x = torch.randn(1,3,720,1280).float().to(device)
+    z = torch.randn(1,64,16,16).float().to(device)
+
     with torch.no_grad():
-        y = model(x, z, torch.tensor([0.5]).cuda().bfloat16())
-        print(y.shape)
-    print(cfg)
+        proxy = vae.encoder(x)
+        y = model(proxy, z, torch.tensor([0.5]).to(device).float())
+        rec = vae.decoder(y)
+        print(rec.shape)

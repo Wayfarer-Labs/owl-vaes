@@ -99,8 +99,8 @@ def log_audio_to_wandb(
     Log audio samples to Weights & Biases.
 
     Args:
-        original: Original audio tensor (B, C, T)
-        reconstructed: Reconstructed audio tensor (B, C, T)
+        original: Original audio tensor (B, N, D) where N=samples, D=channels
+        reconstructed: Reconstructed audio tensor (B, N, D)
         sample_rate: Audio sample rate
         max_samples: Maximum number of samples to log
 
@@ -112,16 +112,19 @@ def log_audio_to_wandb(
 
     for i in range(batch_size):
         # Convert to numpy and ensure correct shape for wandb
-        orig_audio = original[i].detach().cpu().numpy()  # (C, T)
-        rec_audio = reconstructed[i].detach().cpu().numpy()  # (C, T)
+        # (B, N, D) -> (N, D)
+        orig_audio = original[i].detach().cpu().numpy()  # (N, D)
+        rec_audio = reconstructed[i].detach().cpu().numpy()  # (N, D)
 
         # For stereo audio, mix down to mono for logging
-        if orig_audio.shape[0] == 2:
-            orig_mono = np.mean(orig_audio, axis=0)
-            rec_mono = np.mean(rec_audio, axis=0)
+        if orig_audio.shape[-1] == 2:
+            # Average across channels: (N, 2) -> (N,)
+            orig_mono = np.mean(orig_audio, axis=-1)
+            rec_mono = np.mean(rec_audio, axis=-1)
         else:
-            orig_mono = orig_audio[0]
-            rec_mono = rec_audio[0]
+            # Single channel: (N, 1) -> (N,)
+            orig_mono = orig_audio.squeeze(-1)
+            rec_mono = rec_audio.squeeze(-1)
 
         # Ensure audio is in correct range [-1, 1]
         orig_mono = np.clip(orig_mono, -1.0, 1.0)

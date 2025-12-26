@@ -1,5 +1,5 @@
 """
-Trainer for reconstruction only
+Trainer for reconstruction only (for video)
 """
 
 import einops as eo
@@ -16,15 +16,14 @@ from ..muon import init_muon
 from ..nn.lpips import get_lpips_cls
 from ..schedulers import get_scheduler_cls
 from ..utils import Timer, freeze, unfreeze
-from ..utils.logging import LogHelper, to_wandb
+from ..utils.logging import LogHelper, to_wandb_video_sidebyside
 from .base import BaseTrainer
 from ..losses.basic import latent_reg_loss
-from ..losses.dwt import dwt_loss_fn
+from ..losses.dwt import dwt_loss_fn_3d
 
-class RecTrainer(BaseTrainer):
+class VideoRecTrainer(BaseTrainer):
     """
     Trainer for reconstruction only objective.
-    Only does L2 + LPIPS
 
     :param train_cfg: Configuration for training
     :param logging_cfg: Configuration for logging
@@ -130,15 +129,28 @@ class RecTrainer(BaseTrainer):
             wandb.watch(self.get_module(), log = 'all')
 
         # Dataset setup
-        loader = get_loader(self.train_cfg.data_id, self.train_cfg.batch_size, **self.train_cfg.data_kwargs)
+        loader = get_loader(self.train_cfg.data_id, self.train_cfg.batch_size, rank=self.rank, world_size=self.world_size, **self.train_cfg.data_kwargs)
 
         local_step = 0
+
+        def video_interpolate(x, *args, **kwargs):
+            b,t,c,h,w = x.shape
+            x = x.reshape(b*t, c, h, w)
+            x = F.interpolate(x, *args, **kwargs)
+            x = x.reshape(b, t, c, *x.shape[2:])
+            return x
+
+        def flatten_vid(x):
+            b,t,c,h,w = x.shape
+            x = x.reshape(b*t, c, h, w)
+            return x
+
         for _ in range(self.train_cfg.epochs):
             for batch in loader:
                 total_loss = 0.
                 batch = batch.to(self.device).bfloat16()
                 full_batch = batch.clone()
-                batch = F.interpolate(batch, self.model_input_size, mode='bilinear', align_corners=False)
+                batch = video_interpolate(batch, self.model_input_size, mode='bilinear', align_corners=False)
 
                 with ctx:
                     batch_rec, mu, logvar = self.model(batch)
@@ -160,12 +172,12 @@ class RecTrainer(BaseTrainer):
                         metrics.log('l2_loss', l2_loss)
 
                     if dwt_weight > 0.0:
-                        dwt_loss = dwt_loss_fn(batch_rec[:,:3], batch[:,:3]) / accum_steps
+                        dwt_loss = dwt_loss_fn_3d(batch_rec, batch) / accum_steps
                         total_loss += dwt_loss * dwt_weight
                         metrics.log('dwt_loss', dwt_loss)
 
                     if lpips_weight > 0.0:
-                        lpips_loss = lpips(batch_rec[:,:3], batch[:,:3]) / accum_steps
+                        lpips_loss = lpips(flatten_vid(batch_rec), flatten_vid(batch)) / accum_steps
                         total_loss += lpips_loss
                         metrics.log('lpips_loss', lpips_loss)
 
@@ -206,10 +218,9 @@ class RecTrainer(BaseTrainer):
                             with ctx:
                                 full_batch_rec = self.model(full_batch)[0]
                             
-                            wandb_dict['samples'] = to_wandb(
+                            wandb_dict['samples'] = to_wandb_video_sidebyside(
                                 full_batch.detach().contiguous().bfloat16(),
-                                full_batch_rec.detach().contiguous().bfloat16(),
-                                gather = False
+                                full_batch_rec.detach().contiguous().bfloat16()
                             )
                         if self.rank == 0:
                             wandb.log(wandb_dict)

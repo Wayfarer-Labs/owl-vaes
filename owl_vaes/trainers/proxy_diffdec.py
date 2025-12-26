@@ -18,21 +18,14 @@ from ..muon import init_muon
 from ..nn.lpips import get_lpips_cls
 from ..schedulers import get_scheduler_cls
 from ..utils import Timer, freeze, unfreeze, versatile_load
-from ..utils.logging import LogHelper, to_wandb_video_sidebyside
+from ..utils.logging import LogHelper, to_wandb, to_wandb_grayscale
 from .base import BaseTrainer
 from ..configs import Config
-from ..sampling.causdiffdec import causal_diffdec_sample
+from ..sampling import flow_sample
 
-def video_interpolate(x, *args, **kwargs):
-    b,n = x.shape[:2]
-    x = eo.rearrange(x, 'b n ... -> (b n) ...')
-    x = F.interpolate(x, *args, **kwargs)
-    x = eo.rearrange(x, '(b n) ... -> b n ...', b = b, n = n)
-    return x
-
-class VideoDiffDecLiveDepthTrainer(BaseTrainer):
+class DiffDecLiveDepthTrainer(BaseTrainer):
     """
-    Trainer for causal diffusion decoder with proxy VAE + depth encoder
+    Trainer for diffusion decoder with proxy VAE + depth encoder
 
     :param train_cfg: Configuration for training
     :param logging_cfg: Configuration for logging
@@ -78,7 +71,7 @@ class VideoDiffDecLiveDepthTrainer(BaseTrainer):
         self.depth = FlashDepthModel(
             model_size='vits',
             use_mamba=False,
-            checkpoint_path='FlashDepth/configs/flashdepth/iter_43002.pth',
+            checkpoint_path='FlashDepth/configs/flashdepth/iter_43002.pth'
         )
 
         # TAEF1
@@ -126,7 +119,7 @@ class VideoDiffDecLiveDepthTrainer(BaseTrainer):
         # Depth prep
         freeze(self.depth)
         self.depth = self.depth.to(self.device).bfloat16()
-        self.depth.compile()
+        self.depth = torch.compile(self.depth)
 
         # TAEF1 prep
         freeze(self.proxy)
@@ -164,15 +157,9 @@ class VideoDiffDecLiveDepthTrainer(BaseTrainer):
 
         # Dataset setup
         loader = get_loader(self.train_cfg.data_id, self.train_cfg.batch_size, **self.train_cfg.data_kwargs)
-        eval_loader = get_loader(self.train_cfg.eval_data_id, self.train_cfg.batch_size, **self.train_cfg.eval_data_kwargs)
-        eval_loader = iter(eval_loader)
 
         @torch.no_grad()
         def teacher_sample(batch):
-            b,n = batch.shape[:2]
-            batch = eo.rearrange(batch, 'b n ... -> (b n) ...')
-            #print(batch.shape)
-            #exit()
             batch = F.interpolate(batch, (360, 640), mode='bilinear', align_corners=False)
             batch_depth = self.depth(batch).unsqueeze(1)
             batch = torch.cat([batch, batch_depth], dim = 1)
@@ -180,22 +167,12 @@ class VideoDiffDecLiveDepthTrainer(BaseTrainer):
             teacher_std = (logvar/2).exp()
             teacher_z = torch.randn_like(mu) * teacher_std + mu
             teacher_z = teacher_z / self.train_cfg.latent_scale
-            teacher_z = eo.rearrange(teacher_z, '(b n) ... -> b n ...', b = b, n = n)
             return teacher_z
-
-        @torch.no_grad()
-        def teacher_sample_eval(batch):
-            batch_splits = batch.split(self.model_cfg.n_frames, dim = 1)
-            batch_splits = [teacher_sample(batch_split) for batch_split in batch_splits]
-            return torch.cat(batch_splits, dim = 1)
         
         @torch.no_grad()
         def proxy_encode(batch):
-            b,n = batch.shape[:2]
-            batch = eo.rearrange(batch, 'b n ... -> (b n) ...')
             proxy_z = self.proxy.encoder(batch[:,:3])
             proxy_z = proxy_z / self.train_cfg.ldm_scale # [b,16,45,80]
-            proxy_z = eo.rearrange(proxy_z, '(b n) ... -> b n ...', b = b, n = n)
             return proxy_z
 
         for _ in range(self.train_cfg.epochs):
@@ -206,12 +183,10 @@ class VideoDiffDecLiveDepthTrainer(BaseTrainer):
                 with ctx:
                     with torch.no_grad():
                         teacher_z = teacher_sample(batch)
-                        if self.train_cfg.use_proxy:
-                            proxy_z = proxy_encode(batch)
-                        else:
-                            proxy_z = batch
+                        proxy_z = proxy_encode(batch)
                         
                     diff_loss = self.model(proxy_z, teacher_z)
+                    diff_loss = diff_loss
 
                 metrics.log('diff_loss', diff_loss)
                 total_loss += diff_loss
@@ -236,29 +211,21 @@ class VideoDiffDecLiveDepthTrainer(BaseTrainer):
 
                     if self.total_step_counter % self.train_cfg.sample_interval == 0:
                         with ctx:
-                            batch = next(eval_loader)
-                            batch = batch.to(self.device).bfloat16()
-                            teacher_z = teacher_sample_eval(batch)
-                            if self.train_cfg.use_proxy:
-                                proxy_z = proxy_encode(batch)
-                            else:
-                                proxy_z = batch
-                            
-                            cfg_scale = getattr(self.train_cfg, 'cfg_scale', 1.5)
-                            ema_rec = causal_diffdec_sample(
+                            cfg_scale = getattr(self.train_cfg, 'cfg_scale', 1.0)
+                            ema_rec = flow_sample(
                                 self.get_ema_core(),
                                 proxy_z,
                                 teacher_z,
                                 self.train_cfg.sampling_steps,
-                                decoder = self.proxy.decoder if self.train_cfg.use_proxy else None,
+                                self.proxy.decoder,
                                 scaling_factor = self.train_cfg.ldm_scale,
                                 cfg_scale = cfg_scale
                             )
-                            batch = batch[:,(self.model_cfg.n_frames-1):,:3]
 
-                        wandb_dict['samples'] = to_wandb_video_sidebyside(
+                        wandb_dict['samples'] = to_wandb(
                             batch.detach().contiguous().bfloat16(),
-                            ema_rec.detach().contiguous().bfloat16()
+                            ema_rec.detach().contiguous().bfloat16(),
+                            gather = False
                         )
 
                     if self.rank == 0:
@@ -270,3 +237,4 @@ class VideoDiffDecLiveDepthTrainer(BaseTrainer):
                         self.save()
 
                 self.barrier()
+

@@ -1,109 +1,204 @@
-"""
-Diffusion decoder for frame pairs
-
-Idea:
-By diffusing two frames together, we encourage model
-to generate in a way that makes use of other frames latent,
-such that the generation is consistent.
-"""
-
 import torch
 from torch import nn
 import torch.nn.functional as F
 import math
 
 from copy import deepcopy
+import einops as eo
 
-from ..utils import freeze
+from ..utils import freeze, int_to_tuple
 from ..configs import TransformerConfig
 from ..nn.resnet import SquareToLandscape, LandscapeToSquare
 
 from ..nn.dit import DiT, FinalLayer
+
 from ..nn.embeddings import LearnedPosEnc
 from ..nn.embeddings import TimestepEmbedding, StepEmbedding
+from ..nn.attn import get_attn_mask
 
-from .diffdec import DiffusionDecoderCore
+def is_landscape(sample_size):
+    h,w = sample_size
+    ratio = w/h
+    return abs(ratio - 16/9) < 0.01  # Check if ratio is approximately 16:9
 
-class PairDiffDecCore(DiffusionDecoderCore):
+def find_nearest_square(size):
+    h,w = size
+    avg = (h + w) / 2
+    return 2 ** int(round(torch.log2(torch.tensor(avg)).item()))
+
+def vid_pixel_shuffle(x, shuffle_factor):
+    b,n = x.shape[:2]
+    x = eo.rearrange(x, 'b n ... -> (b n) ...')
+    x = F.pixel_shuffle(x, shuffle_factor)
+    x = eo.rearrange(x, '(b n) ... -> b n ...', n = n)
+    return x
+
+def vid_pixel_unshuffle(x, shuffle_factor):
+    b,n = x.shape[:2]
+    x = eo.rearrange(x, 'b n ... -> (b n) ...')
+    x = F.pixel_unshuffle(x, shuffle_factor)
+    x = eo.rearrange(x, '(b n) ... -> b n ...', n = n)
+    return x
+
+class CausalDiffusionDecoderCore(nn.Module):
     def __init__(self, config : TransformerConfig):
-        super().__init__(config)
+        super().__init__()
 
-        self.pos_enc_prev_z = LearnedPosEnc(config.latent_size**2, config.d_model)
+        size = config.sample_size
+        patch_size = config.patch_size
+        if isinstance(patch_size, int):
+            patch_size = [patch_size, patch_size]
+        n_tokens = size[0] // patch_size[0] * size[1] // patch_size[1]
 
-    def flatten(self, x):
-        b, c, h, w = x.shape
-        x = x.view(b, c, self.n_p_y, self.p, self.n_p_x, self.p)
-        x = x.permute(0, 2, 4, 3, 5, 1).contiguous()
-        x = x.view(b, self.n_p_y * self.n_p_x, self.p * self.p * c)
-    
-    def flatten_latent(self, x):
-        b, c, h, w = x.shape
-        x = x.permute(0, 2, 3, 1).contiguous().view(b, h * w, c)
+        self.proj_in = nn.Linear(patch_size[0] * patch_size[1] * config.channels, config.d_model, bias = False)
 
-    def forward(self, x, z_x, z_y, ts, y = None):
-        # x is [b,c,h,w] (frame)
-        # y is [b,c,h,w] (prev frame)
-        # z_x is [b,c,h,w] (latent of x)
-        # z_y is [b,c,h,w] (latent of y)
+        self.proj_out = nn.Linear(config.d_model, patch_size[0] * patch_size[1] * config.channels, bias = False)
+
+        self.ts_embed = TimestepEmbedding(config.d_model)
+        
+        self.proj_in_z = nn.Linear(config.latent_channels, config.d_model)
+
+        self.final = FinalLayer(config, skip_proj = True)
+
+        config.causal = True
+        self.blocks = DiT(config)
+        self.config = config
+
+        self.shuffle_factor = getattr(config, "shuffle_factor", 1)
+        self.p_y, self.p_x = patch_size
+        self.n_p_y = config.sample_size[0] // self.p_y
+        self.n_p_x = config.sample_size[1] // self.p_x
+        self.n_frames = config.n_frames
+
+        # Learned null embedding for CFG
+        self.null_emb = nn.Parameter(torch.zeros(config.latent_channels, config.latent_size, config.latent_size))
+
+    def forward(self, x, z, ts, attn_mask = None):
+        # x is [b,n,c,h,w]
+        # z is [b,n,c,h,w] but different size cause latent
+        # ts is [b,n] in [0,1] - per-frame timesteps
+
+        if attn_mask is None:
+            max_q = self.n_p_y * self.n_p_x * self.n_frames
+            max_q += self.config.latent_size ** 2 * self.n_frames
+            max_kv = max_q
+            attn_mask = get_attn_mask(
+                self.config,
+                batch_size = x.shape[0],
+                device = x.device,
+                max_q_len = max_q,
+                max_kv_len = max_kv,
+                kernel_size = int_to_tuple(getattr(self.config, "kernel", None))
+            )
+
+        if self.shuffle_factor > 1:
+            x = vid_pixel_unshuffle(x, self.shuffle_factor)
 
         cond = self.ts_embed(ts)
 
-        x = self.flatten(x)
-        x = self.proj_in(x)
-        x = self.pos_enc_x(x)
+        x = eo.rearrange(
+            x,
+            'b t c (n_p_y p_y) (n_p_x p_x) -> b (t n_p_y n_p_x) (p_y p_x c)',
+            n_p_y = self.n_p_y,
+            n_p_x = self.n_p_x
+        )
 
-        z_x = self.flatten_latent(z_x)
-        z_y = self.flatten_latent(z_y)
-        z_x = self.proj_in_z(z_x)
-        z_y = self.proj_in_z(z_y)
-        z_x = self.pos_enc_z(z_x)
-        z_y = self.pos_enc_z(z_y)
+        z = eo.rearrange(
+            z,
+            'b t c h w -> b (t h w) c'
+        )
 
+        x = self.proj_in(x) # -> [b,n,d]
+        z = self.proj_in_z(z)
+
+        
         n = x.shape[1]
-        x = torch.cat([x,z_x,self.pos_enc_prev_z(z_y)],dim=1)
-        x = self.blocks(x, cond)
+        x = torch.cat([x,z],dim=1)
+
+        x = self.blocks(x, cond, attn_mask = attn_mask)
         x = x[:,:n]
+
         x = self.final(x, cond)
+        x = self.proj_out(x)
 
-        if y is not None:
-            y = self.flatten(y)
-            y = self.proj_in(y)
-            y = self.pos_enc_x(y)
-            y = torch.cat([y,z_y,self.pos_enc_prev_z(z_x)],dim=1)
-            y = self.blocks(y, cond)
-            y = y[:,:n]
-            y = self.final(y, cond)
-            return x,y
-        else:
-            return x
+        x = eo.rearrange(
+            x,
+            'b (t n_p_y n_p_x) (p_y p_x c) -> b t c (n_p_y p_y) (n_p_x p_x)',
+            n_p_y = self.n_p_y,
+            n_p_x = self.n_p_x,
+            p_y = self.p_y,
+            p_x = self.p_x
+        )
 
-class PairDiffDec(nn.Module):
+        if self.shuffle_factor > 1:
+            x = vid_pixel_shuffle(x, self.shuffle_factor)
+
+        return x
+
+class CausalDiffusionDecoder(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.core = PairDiffDecCore(config)
-    
-    def forward(self, x, y, z_x, z_y):
-        """
-        For training we assume y is always given
-        """
+        self.core = CausalDiffusionDecoderCore(config)
+
+        self.ts_mu = 0.0
+        self.ts_sigma = 1.0
+        self.cfg_prob = getattr(config, "cfg_prob", 0.0)
+        self.prev_noise = getattr(config, "prev_noise", 0.0)
+
+    @torch.no_grad()
+    def sample_timesteps(self, b, n, device, dtype):
+        # Sample ts in [0, 1] from a normal distribution, then sigmoid
+        # Per-frame timesteps: [B, N]
+        ts = torch.randn(b, n, device=device, dtype=dtype)
+        ts = ts * self.ts_sigma - self.ts_mu
+        ts = ts.sigmoid()
+        return ts
+
+    def forward(self, x, z):
+        # x is [b,n,c,h,w]
+        # z is [b,n,c,h,w] with latent size
+        b, n = x.shape[:2]
+
         with torch.no_grad():
-            ts = torch.randn(len(x), device = x.device, dtype = x.dtype).sigmoid()
+            # Sample per-frame timesteps [B,N]
+            ts = self.sample_timesteps(b, n, x.device, x.dtype)
 
-            eps_x = torch.randn_like(x)
-            eps_y = torch.randn_like(y)
-            ts_exp = ts.view(-1, 1, 1, 1).expand_as(x)
+            eps = torch.randn_like(x)
+            # Expand timesteps to match x shape [B,N,C,H,W]
+            ts_exp = ts.view(b, n, 1, 1, 1)
 
-            lerpd_x = x * (1. - ts_exp) + ts_exp * eps_x
-            lerpd_y = y * (1. - ts_exp) + ts_exp * eps_y
+            lerpd = x * (1. - ts_exp) + ts_exp * eps
+            target = eps - x
 
-            target_x = eps_x - x
-            target_y = eps_y - y
+            # CFG per-frame: randomly dropout individual frames
+            if self.cfg_prob > 0:
+                mask = torch.rand(b, n, device=z.device) < self.cfg_prob  # [B,N]
+                z = z.clone()
+                # Expand mask to match z dimensions [B,N,C,H,W]
+                mask_exp = mask.view(b, n, 1, 1, 1)
+                # Expand null_emb to broadcast [1,1,C,H,W]
+                null_exp = self.core.null_emb.view(1, 1, *self.core.null_emb.shape)
+                z = torch.where(mask_exp, null_exp, z)
 
-        pred_x, pred_y = self.core(lerpd_x, z_x, z_y, ts, y)
+        pred = self.core(lerpd, z, ts)
+        diff_loss = F.mse_loss(pred, target)
 
-        diff_loss_x = F.mse_loss(pred_x, target_x)
-        diff_loss_y = F.mse_loss(pred_y, target_y)
+        return diff_loss
 
-        return 0.5 * (diff_loss_x + diff_loss_y)
-    
+if __name__ == "__main__":
+    from ..configs import Config
+    import torch
+    import torch.nn.functional as F
+
+    device = 'cuda'
+
+    cfg = Config.from_yaml("configs/waypoint_1/wp1_caus_diffdec_360p.yml").model
+
+    model = CausalDiffusionDecoder(cfg).float().to(device)
+    x = torch.randn(1,2,16,45,80).float().to(device)
+    z = torch.randn(1,2,64,16,16).float().to(device)
+
+    with torch.no_grad():
+        diff_loss = model(x, z)
+        print(diff_loss)

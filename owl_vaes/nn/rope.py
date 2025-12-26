@@ -1,41 +1,12 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+import einops as eo
 
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 
-def scatter_heads(full_x: torch.Tensor, x: torch.Tensor, mask: torch.Tensor):
-    """
-    full_x: [b, h, n, d]  (destination buffer; modified in-place)
-    x:      [b, h, m, d]  (values to insert)
-    mask:   [b, n]        (exactly m True per row)
-
-    Returns: full_x with x scattered into positions where mask==True (per batch row).
-    """
-    assert full_x.dim() == 4 and x.dim() == 4 and mask.dim() == 2
-    b, h, n, d = full_x.shape
-    bb, hh, m, dd = x.shape
-    bm, nm = mask.shape
-    assert b == bb == bm and h == hh and n == nm and d == dd, "shape mismatch"
-    # Build per-row source indices (where mask is True) -> [b, m]
-    sel_idx = torch.arange(n, device=x.device).expand(b, n)[mask].reshape(b, m)  # [b, m]
-    # Expand to match [b, h, m, d] so we can scatter along dim=2 (the n-dimension)
-    index_n = sel_idx[:, None, :, None].expand(b, h, m, d)                      # [b, h, m, d]
-    # In-place scatter: write x into full_x at those positions
-    full_x.scatter_(dim=2, index=index_n, src=x)
-    return full_x
-
-def int_to_tuple(x):
-    if isinstance(x, int):
-        return (x,x)
-    elif isinstance(x, tuple) or isinstance(x, list):
-        return x
-    else:
-        try:
-            return tuple(x)
-        except:
-            raise ValueError(f"Invalid input: {x}")
-
+from ..utils import int_to_tuple
+            
 def get_rope_impl(impl_name):
     impl_name = impl_name.lower()
     if impl_name == "simple":
@@ -44,6 +15,10 @@ def get_rope_impl(impl_name):
         return ImageRoPE
     elif impl_name == "image+latent":
         return ImageRoPEWithLatent
+    elif impl_name == "video+latent":
+        return VideoRoPEWithLatents
+    elif impl_name == "video":
+        return VideoRoPE
     else:
         raise ValueError(f"Invalid rope implementation: {impl_name}")
 
@@ -51,12 +26,14 @@ class SimpleRoPE(nn.Module):
     """
     1D Rotary Positional Embedding for sequence data.
     """
-    def __init__(self, d_model, n_heads):
+    def __init__(self, config):
         super().__init__()
+        d_model = config.d_model
+        n_heads = config.n_heads
         self.dim_head = d_model // n_heads
         self.rope = RotaryEmbedding(self.dim_head, freqs_for="lang", theta = 300)
 
-    def forward(self, q, k, tread_mask = None):
+    def forward(self, q, k):
         q = self.apply(q)
         k = self.apply(k)
         return q, k
@@ -81,13 +58,14 @@ class ImageRoPE(nn.Module):
         rope_emb = RotaryEmbedding(
             dim_head // 4,
             freqs_for = 'pixel',
-            max_freq = 256
+            max_freq = min(n_p_y, n_p_x) * 0.8
         )
         freqs = rope_emb.get_axial_freqs(
             n_p_y,
             n_p_x
         )
         self.register_buffer('freqs', freqs, persistent=False)
+
         self.n_p_y = n_p_y
         self.n_p_x = n_p_x
 
@@ -124,7 +102,7 @@ class ImageRoPEWithLatent(nn.Module):
         rope_emb = RotaryEmbedding(
             dim_head // 4,
             freqs_for = 'pixel',
-            max_freq = 256
+            max_freq = min(n_p_y_rope, n_p_x_rope) * 0.8
         )
         freqs = rope_emb.get_axial_freqs(
             n_p_y_rope,
@@ -137,12 +115,7 @@ class ImageRoPEWithLatent(nn.Module):
         self.n_latent = config.latent_size
         self.n_heads = config.n_heads
 
-    def apply(self, x, tread_mask = None):
-        b_orig,h_orig,n_orig,d_orig = x.shape
-        if tread_mask is not None:
-            full_x = torch.zeros(b_orig,h_orig,tread_mask.shape[1],d_orig, device=x.device, dtype=x.dtype)
-            x = scatter_heads(full_x, x, tread_mask)
-
+    def apply(self, x):
         x_image = x[:,:,:self.n_image]
         x_latent = x[:,:,self.n_image:]
         
@@ -170,15 +143,154 @@ class ImageRoPEWithLatent(nn.Module):
         x_latent = x_latent.view(b,h,self.n_latent**2,d)
         x = torch.cat([x_image, x_latent], dim = 2)
 
-        if tread_mask is not None:
-            tread_mask_head = tread_mask[:,None,:].repeat(1,self.n_heads,1)
-            x = x[tread_mask_head].view(b_orig,h_orig,-1,d_orig)
-
         return x
     
-    def forward(self, q, k, tread_mask = None):
-        q = self.apply(q, tread_mask)
-        k = self.apply(k, tread_mask)
+    def forward(self, q, k):
+        q = self.apply(q)
+        k = self.apply(k)
+        return q, k
+
+class VideoRoPEWithLatents(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        h,w = int_to_tuple(config.sample_size)
+        p_y, p_x = int_to_tuple(config.patch_size)
+        n_frames = config.n_frames
+
+        n_p_y = h // p_y
+        n_p_x = w // p_x
+        n_p_y_rope = n_p_y + config.latent_size
+        n_p_x_rope = n_p_x + config.latent_size
+
+        dim_head = config.d_model // config.n_heads
+        rope_emb = RotaryEmbedding(
+            dim_head // 8,
+            freqs_for = 'pixel',
+            max_freq = min(n_p_y_rope, n_p_x_rope) * 0.8
+        )
+        freqs = rope_emb.get_axial_freqs(
+            n_frames,
+            n_p_y_rope,
+            n_p_x_rope
+        )
+        self.register_buffer('freqs', freqs, persistent=False)
+        self.n_p_y = n_p_y
+        self.n_p_x = n_p_x
+        self.n_latent = config.latent_size
+        self.n_frames = n_frames
+        self.n_heads = config.n_heads
+
+        self.n_images = n_p_y * n_p_x
+        self.n_video = n_frames * self.n_images
+
+    def apply(self, x):
+        orig_dtype = x.dtype
+
+        # x is bhnd
+        x_video = x[:,:,:self.n_video]
+        x_latent = x[:,:,self.n_video:]
+
+
+        b,h,n,d = x_video.shape
+        x_video = eo.rearrange(
+            x_video,
+            'b h (n_frames n_p_y n_p_x) d -> b h n_frames n_p_y n_p_x d',
+            n_frames = self.n_frames,
+            n_p_y = self.n_p_y,
+        )
+        x_latent = eo.rearrange(
+            x_latent,
+            'b h (n_frames n_latent_1 n_latent_2) d -> b h n_frames n_latent_1 n_latent_2 d',
+            n_frames = self.n_frames,
+            n_latent_1 = self.n_latent,
+            n_latent_2 = self.n_latent,
+        )
+
+        # "big video" where bottom right is latent
+        pad_right = torch.zeros((b,h,self.n_frames,self.n_p_y,self.n_latent,d), dtype = x.dtype, device = x.device)
+        pad_bottom = torch.zeros((b,h,self.n_frames,self.n_latent,self.n_p_x,d), dtype = x.dtype, device = x.device)
+        pad_bottom = torch.cat([pad_bottom, x_latent], dim = 4)
+            
+        # Now add padding and padding + latent
+        x_video = torch.cat([x_video, pad_right], dim = 4)
+        x_video = torch.cat([x_video, pad_bottom], dim = 3) # [h,w] -> [h+l,w+l]
+
+        x_video = apply_rotary_emb(self.freqs.detach().float(), x_video.float()).to(x_video.dtype)
+        x_latent = x_video[:,:,:,self.n_p_y:,self.n_p_x:].contiguous()
+        x_video = x_video[:,:,:,:self.n_p_y,:self.n_p_x].contiguous()
+
+        x_video = eo.rearrange(
+            x_video,
+            'b h n_frames n_p_y n_p_x d -> b h (n_frames n_p_y n_p_x) d'
+        )
+        x_latent = eo.rearrange(
+            x_latent,
+            'b h n_frames n_latent_1 n_latent_2 d -> b h (n_frames n_latent_1 n_latent_2) d',
+            n_frames = self.n_frames,
+            n_latent_1 = self.n_latent,
+            n_latent_2 = self.n_latent,
+        )
+        x = torch.cat([x_video, x_latent], dim = 2)
+
+        return x.to(orig_dtype)
+    
+    def forward(self, q, k):
+        q = self.apply(q)
+        k = self.apply(k)
+        return q, k
+
+class VideoRoPE(nn.Module):
+    """
+    Same as above but without any latents (simplifies a lot)
+    """
+    def __init__(self, config):
+        super().__init__()
+
+        h,w = int_to_tuple(config.sample_size)
+        p_y, p_x = int_to_tuple(config.patch_size)
+        n_frames = config.n_frames
+
+        n_p_y = h // p_y
+        n_p_x = w // p_x
+
+        dim_head = config.d_model // config.n_heads
+        rope_emb = RotaryEmbedding(
+            dim_head // 8,
+            freqs_for = 'pixel',
+            max_freq = min(n_p_y, n_p_x) * 0.8
+        )
+        freqs = rope_emb.get_axial_freqs(
+            n_frames,
+            n_p_y,
+            n_p_x
+        )
+        self.register_buffer('freqs', freqs, persistent=False)
+
+        self.n_p_y = n_p_y
+        self.n_p_x = n_p_x
+        self.n_heads = config.n_heads
+
+    def apply(self, x):
+        orig_dtype = x.dtype
+
+        b,h,n,d = x.shape
+        x = eo.rearrange(
+            x,
+            'b h (n_frames n_p_y n_p_x) d -> b h n_frames n_p_y n_p_x d',
+            n_p_y = self.n_p_y,
+            n_p_x = self.n_p_x,
+        )
+        x = apply_rotary_emb(self.freqs[-x.shape[2]:].detach().float(), x.float()).to(x.dtype)
+        x = eo.rearrange(
+            x,
+            'b h n_frames n_p_y n_p_x d -> b h (n_frames n_p_y n_p_x) d',
+        )
+        return x.to(orig_dtype)
+    
+    def forward(self, q, k):
+        q = self.apply(q)
+        k = self.apply(k)
         return q, k
 
 if __name__ == "__main__":

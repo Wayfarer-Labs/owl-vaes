@@ -222,7 +222,7 @@ class RandomWaveformDataset(IterableDataset):
             #if max_val > 1.0:
             #    audio_tensor = audio_tensor / max_val
 
-            yield audio_tensor.contiguous().clone()
+            yield audio_tensor.contiguous().clone().permute(1,0)
 
 def get_loader(batch_size, num_workers=4, **data_kwargs):
     if "seed" not in data_kwargs:

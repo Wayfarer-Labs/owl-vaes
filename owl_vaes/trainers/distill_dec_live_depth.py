@@ -1,23 +1,27 @@
+"""
+Trainer for distilling decoder with adversarial loss
+Combines image and audio training approaches with feature matching
+"""
+
 import einops as eo
 import torch
 import torch.nn.functional as F
 import wandb
 from ema_pytorch import EMA
 from torch.nn.parallel import DistributedDataParallel as DDP
+from copy import deepcopy
 
 from ..data import get_loader
 from ..models import get_model_cls
 from ..discriminators import get_discriminator_cls
+from ..muon import init_muon
 from ..nn.lpips import get_lpips_cls
 from ..schedulers import get_scheduler_cls
 from ..utils import Timer, freeze, unfreeze, versatile_load
-from ..utils.logging import LogHelper, to_wandb_video_sidebyside
+from ..utils.logging import LogHelper, to_wandb, to_wandb_grayscale
 from .base import BaseTrainer
 from ..configs import Config
-from ..sampling.causdec import CausDecSampler
-
-import gc
-
+from ..losses.dwt import dwt_loss_fn
 from ..losses.gan import (
     merged_d_losses,
     d_loss,
@@ -26,10 +30,10 @@ from ..losses.gan import (
     rec_g_loss,
 )
 
-class CausalDistillDecoderTrainer(BaseTrainer):
+class DistillDecLiveDepthTrainer(BaseTrainer):
     """
     Trainer for distilling the decoder, with frozen encoder.
-    Does L2 + LPIPS + GAN + Feature Matching + R1/R2 regularization
+    Does L1 + DWL + LPIPS + GAN
 
     :param train_cfg: Configuration for training
     :param logging_cfg: Configuration for logging
@@ -61,8 +65,10 @@ class CausalDistillDecoderTrainer(BaseTrainer):
                 encoder.load_state_dict(encoder_ckpt)
             except:
                 encoder.encoder.load_state_dict(encoder_ckpt)
-            encoder.encoder.skip_logvar = False
-            encoder.encoder.conv_out_logvar = self.encoder.conv_out_logvar
+            
+            if encoder.encoder.skip_logvar:
+                encoder.encoder.skip_logvar = False
+                encoder.encoder.conv_out_logvar = self.encoder.conv_out_logvar
             self.encoder = encoder.encoder
 
         model_id = self.model_cfg.model_id
@@ -76,11 +82,9 @@ class CausalDistillDecoderTrainer(BaseTrainer):
         if gan_weight > 0.0:
             disc_cfg = self.model_cfg.discriminator
             self.discriminator = get_discriminator_cls(disc_cfg.model_id)(disc_cfg)
-            self.disc_2 = get_discriminator_cls("patchgan")(disc_cfg)
             self.use_rec_disc = (self.model_cfg.discriminator.model_id == 'recgan')
         else:
             self.discriminator = None
-            self.disc_2 = None
 
         # Checking for DCAE "stage 3"
         self.model_input_size = [int(self.model_cfg.sample_size[0]), int(self.model_cfg.sample_size[1])]
@@ -96,11 +100,19 @@ class CausalDistillDecoderTrainer(BaseTrainer):
         self.ema = None
         self.opt = None
         self.d_opt = None
-        self.d_2_opt = None
         self.scheduler = None
         self.scaler = None
 
         self.total_step_counter = 0
+
+        import sys
+        sys.path.append("./FlashDepth")
+        from flashdepth import FlashDepthModel
+        self.depth = FlashDepthModel(
+            model_size='vits',
+            use_mamba=False,
+            checkpoint_path='FlashDepth/configs/flashdepth/iter_43002.pth'
+        )
 
     def save(self):
         save_dict = {
@@ -139,8 +151,7 @@ class CausalDistillDecoderTrainer(BaseTrainer):
 
         # Loss weights
         lpips_weight = self.train_cfg.loss_weights.get('lpips', 0.0)
-        gan_weight = self.train_cfg.loss_weights.get('gan', 0.5)
-        r12_weight = self.train_cfg.loss_weights.get('r12', 0.0)
+        gan_weight = self.train_cfg.loss_weights.get('gan', 0.1)
         dwt_weight = self.train_cfg.loss_weights.get('dwt', 0.0)
         l1_weight = self.train_cfg.loss_weights.get('l1', 0.0)
         l2_weight = self.train_cfg.loss_weights.get('l2', 0.0)
@@ -156,12 +167,6 @@ class CausalDistillDecoderTrainer(BaseTrainer):
             if self.world_size > 1:
                 self.discriminator = DDP(self.discriminator)
             freeze(self.discriminator)
-        
-        if self.disc_2 is not None:
-            self.disc_2 = self.disc_2.to(self.device).train()
-            if self.world_size > 1:
-                self.disc_2 = DDP(self.disc_2)
-            freeze(self.disc_2)
 
         lpips = None
         if lpips_weight > 0.0:
@@ -171,8 +176,11 @@ class CausalDistillDecoderTrainer(BaseTrainer):
         self.encoder = self.encoder.to(self.device).bfloat16()
         freeze(self.encoder)
         self.encoder = torch.compile(self.encoder)#, mode='max-autotune',dynamic=False,fullgraph=True)
-        self.teacher_decoder = self.teacher_decoder.to(self.device).bfloat16().eval()
-        freeze(self.teacher_decoder)
+        self.teacher_decoder = self.teacher_decoder.to(self.device).bfloat16()
+
+        # Depth prep
+        self.depth = self.depth.to(self.device).bfloat16()
+        self.depth = torch.compile(self.depth)
 
         self.ema = EMA(
             self.model,
@@ -187,9 +195,6 @@ class CausalDistillDecoderTrainer(BaseTrainer):
         self.opt = opt_cls(self.model.parameters(), **self.train_cfg.opt_kwargs)
         if self.discriminator is not None:
             self.d_opt = opt_cls(self.discriminator.parameters(), **self.train_cfg.opt_kwargs)
-
-        if self.disc_2 is not None:
-            self.d_2_opt = opt_cls(self.disc_2.parameters(), **self.train_cfg.opt_kwargs)
 
         if self.train_cfg.scheduler is not None:
             self.scheduler = get_scheduler_cls(self.train_cfg.scheduler)(self.opt, **self.train_cfg.scheduler_kwargs)
@@ -212,27 +217,6 @@ class CausalDistillDecoderTrainer(BaseTrainer):
 
         # Dataset setup
         loader = get_loader(self.train_cfg.data_id, self.train_cfg.batch_size, **self.train_cfg.data_kwargs)
-        sample_loader = get_loader(
-            "procedural_rgb",
-            1,
-            root_dir="/mnt/data/waypoint_1/data/MKIF_360P",
-            output_dir="/mnt/data/waypoint_1/data_pt/MKIF_360P",
-            window_size=32,
-            target_size=[512,512]
-        )
-        sample_loader = iter(sample_loader)
-        sampler = CausDecSampler()
-
-        def pack(x):
-            # b n c h w -> (b*n) c h w
-            b, n, c, h, w = x.shape
-            return x.contiguous().view(b * n, c, h, w)
-        
-        def unpack(x, b=self.train_cfg.target_batch_size):
-            # (b*n) c h w -> b n c h w
-            bn, c, h, w = x.shape
-            n = bn // b
-            return x.contiguous().view(b, n, c, h, w)
 
         def warmup_weight():
             if self.total_step_counter < self.train_cfg.delay_adv:
@@ -247,52 +231,36 @@ class CausalDistillDecoderTrainer(BaseTrainer):
         def warmup_gan_weight(): return warmup_weight() * gan_weight
         
         @torch.no_grad()
-        def sample_from_teacher(batch_rgb):
-            orig_b = batch_rgb.shape[0]
-            batch_rgb = batch_rgb.cuda().bfloat16()
-            batch_rgb = pack(batch_rgb)
-            # convert to [bt,]
-            t_mu, t_logvar = self.encoder(batch_rgb)
-            t_std = (t_logvar/2).exp()
-            t_z = torch.randn_like(t_mu) * t_std + t_mu
-            t_z = t_z / self.train_cfg.latent_scale
-            return unpack(t_z, orig_b)
-
-        def video_interpolate(vid, target_size, mode = 'bilinear', align_corners = False):
-            b,t,c,h,w = vid.shape
-            vid = vid.reshape(b*t, c, h, w)
-            vid = F.interpolate(vid, size=target_size, mode=mode, align_corners=align_corners)
-            vid = vid.reshape(b, t, c, *vid.shape[2:])
-            return vid
+        def teacher_sample(batch):
+            batch = F.interpolate(batch, (360, 640), mode='bilinear', align_corners=False)
+            batch_depth = self.depth(batch).unsqueeze(1)
+            batch = torch.cat([batch, batch_depth], dim = 1)
+            mu, logvar = self.encoder(batch)
+            teacher_std = (logvar/2).exp()
+            teacher_z = torch.randn_like(mu) * teacher_std + mu
+            teacher_z = teacher_z / self.train_cfg.latent_scale
+            return teacher_z
 
         local_step = 0
         for _ in range(self.train_cfg.epochs):
             for batch in loader:
                 total_loss = 0.
                 batch = batch.to(self.device).bfloat16()
-                batch = video_interpolate(batch, self.model_input_size, mode='bilinear', align_corners=False)
 
                 with ctx:
                     with torch.no_grad():
-                        teacher_z = sample_from_teacher(batch)
+                        teacher_z = teacher_sample(batch)
+                        batch = batch[:,:3]
 
                     batch_rec = self.model(teacher_z)
 
                     # Discriminator training - RGB only
                     if self.discriminator is not None and self.total_step_counter >= self.train_cfg.delay_adv:
                         unfreeze(self.discriminator)
-                        disc_loss = d_loss(self.discriminator, batch_rec.detach(), batch.detach()) / accum_steps
+                        disc_loss = d_loss(self.discriminator, batch_rec[:,:3].detach(), batch[:,:3].detach()) / accum_steps
                         metrics.log('disc_loss', disc_loss)
-
                         self.scaler.scale(disc_loss).backward()
                         freeze(self.discriminator)
-                    
-                    if self.disc_2 is not None and self.total_step_counter >= self.train_cfg.delay_adv:
-                        unfreeze(self.disc_2)
-                        disc_loss = d_loss(self.disc_2, pack(batch_rec.detach()), pack(batch.detach())) / accum_steps
-                        metrics.log('disc_loss_2d', disc_loss)
-                        self.scaler.scale(disc_loss).backward()
-                        freeze(self.disc_2)
 
                     if l2_weight > 0.0:
                         l2_loss = F.mse_loss(batch_rec, batch) / accum_steps
@@ -301,18 +269,24 @@ class CausalDistillDecoderTrainer(BaseTrainer):
 
                     if lpips_weight > 0.0:
                         with ctx:
-                            lpips_loss = lpips(pack(batch_rec), pack(batch)) / accum_steps
+                            lpips_loss = lpips(batch_rec[:,:3], batch[:,:3]) / accum_steps
                         total_loss += lpips_loss * lpips_weight
                         metrics.log('lpips_loss', lpips_loss)
+                    
+                    if dwt_weight > 0.0:
+                        with ctx:
+                            dwt_loss = dwt_loss_fn(batch_rec[:,:3], batch[:,:3]) / accum_steps
+                        total_loss += dwt_loss * dwt_weight
+                        metrics.log('dwt_loss', dwt_loss)
                     
                     if self.discriminator is not None:
                         crnt_gan_weight = warmup_gan_weight()
                         if crnt_gan_weight > 0.0:
                             with ctx:
-                                gan_loss = g_loss(self.discriminator, batch_rec)
-                                if self.disc_2 is not None:
-                                    gan_loss_2 = g_loss(self.disc_2, pack(batch_rec))
-                                    gan_loss = gan_loss + gan_loss_2
+                                if self.use_rec_disc:
+                                    gan_loss = rec_g_loss(self.discriminator, batch_rec[:,:3], batch[:,:3])
+                                else:
+                                    gan_loss = g_loss(self.discriminator, batch_rec[:,:3])
                                 gan_loss = gan_loss / accum_steps
                             metrics.log('gan_loss', gan_loss)
                             total_loss += crnt_gan_weight * gan_loss
@@ -322,16 +296,12 @@ class CausalDistillDecoderTrainer(BaseTrainer):
                 local_step += 1
                 if local_step % accum_steps == 0:
                     # Updates
-                    #self.scaler.unscale_(self.opt)
-                    #torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.scaler.unscale_(self.opt)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
 
-                    #if self.discriminator is not None and self.total_step_counter >= self.train_cfg.delay_adv:
-                    #    self.scaler.unscale_(self.d_opt)
-                    #    torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
-
-                    #if self.disc_2 is not None and self.total_step_counter >= self.train_cfg.delay_adv:
-                        #self.scaler.unscale_(self.d_2_opt)
-                        #torch.nn.utils.clip_grad_norm_(self.disc_2.parameters(), max_norm=1.0)
+                    if self.discriminator is not None and self.total_step_counter >= self.train_cfg.delay_adv:
+                        self.scaler.unscale_(self.d_opt)
+                        torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
 
                     self.scaler.step(self.opt)
                     self.opt.zero_grad(set_to_none=True)
@@ -339,11 +309,7 @@ class CausalDistillDecoderTrainer(BaseTrainer):
                     if self.discriminator is not None and self.total_step_counter >= self.train_cfg.delay_adv:
                         self.scaler.step(self.d_opt)
                         self.d_opt.zero_grad(set_to_none=True)
-
-                    if self.disc_2 is not None and self.total_step_counter >= self.train_cfg.delay_adv:
-                        self.scaler.step(self.d_2_opt)
-                        self.d_2_opt.zero_grad(set_to_none=True)
-
+                    
                     self.scaler.update()
 
                     if self.scheduler is not None:
@@ -358,27 +324,16 @@ class CausalDistillDecoderTrainer(BaseTrainer):
                         timer.reset()
 
                         if self.total_step_counter % self.train_cfg.sample_interval == 0:
-                            sample_rgb = next(sample_loader) # bnchw
-                            sample_rgb = sample_rgb.cuda().bfloat16()
-                            sample_rgb = video_interpolate(sample_rgb, (512,512), mode='bilinear', align_corners=False)
-                            teacher_z = sample_from_teacher(sample_rgb)
                             with ctx:
-                                ema_rec = sampler(self.ema.ema_model, teacher_z, window_size = 4)
+                                ema_rec = self.ema.ema_model(teacher_z)
+                            teacher_rec = self.teacher_decoder(teacher_z.bfloat16())[:,:3]
 
-                            if self.world_size > 1:
-                                sample_rgb_list = [torch.zeros_like(sample_rgb) for _ in range(self.world_size)]
-                                torch.distributed.all_gather(sample_rgb_list, sample_rgb.contiguous())
-                                sample_rgb = torch.cat(sample_rgb_list, dim=0)
-                                
-                                ema_rec_list = [torch.zeros_like(ema_rec) for _ in range(self.world_size)]
-                                torch.distributed.all_gather(ema_rec_list, ema_rec)
-                                ema_rec = torch.cat(ema_rec_list, dim=0)
+                            wandb_dict['samples'] = to_wandb(
+                                teacher_rec.detach().contiguous().bfloat16(),
+                                ema_rec.detach().contiguous().bfloat16(),
+                                gather = False
+                            )
 
-                            if self.rank == 0:
-                                wandb_dict['samples'] = to_wandb_video_sidebyside(
-                                    sample_rgb.detach().contiguous().bfloat16(),
-                                    ema_rec.detach().contiguous().bfloat16()
-                                )
                         if self.rank == 0:
                             wandb.log(wandb_dict)
 
