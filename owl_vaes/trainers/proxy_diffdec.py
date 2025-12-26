@@ -21,7 +21,7 @@ from ..utils import Timer, freeze, unfreeze, versatile_load
 from ..utils.logging import LogHelper, to_wandb, to_wandb_grayscale
 from .base import BaseTrainer
 from ..configs import Config
-from ..sampling import flow_sample
+from ..sampling import flow_sample, x0_sample
 
 class DiffDecLiveDepthTrainer(BaseTrainer):
     """
@@ -76,7 +76,10 @@ class DiffDecLiveDepthTrainer(BaseTrainer):
 
         # TAEF1
         from diffusers import AutoencoderTiny
-        self.proxy = AutoencoderTiny.from_pretrained("madebyollin/taef1")
+        proxy_id = getattr(self.train_cfg, 'proxy_id', 'madebyollin/taef1')
+        self.no_proxy = (proxy_id is None) or (proxy_id == 'null') or (proxy_id == 'None')
+        if not self.no_proxy:
+            self.proxy = AutoencoderTiny.from_pretrained(proxy_id)
 
     def save(self):
         save_dict = {
@@ -122,10 +125,11 @@ class DiffDecLiveDepthTrainer(BaseTrainer):
         self.depth = torch.compile(self.depth)
 
         # TAEF1 prep
-        freeze(self.proxy)
-        self.proxy = self.proxy.to(self.device).bfloat16()
-        self.proxy.encoder = torch.compile(self.proxy.encoder)
-        self.proxy.decoder = torch.compile(self.proxy.decoder)
+        if not self.no_proxy:
+            freeze(self.proxy)
+            self.proxy = self.proxy.to(self.device).bfloat16()
+            self.proxy.encoder = torch.compile(self.proxy.encoder)
+            self.proxy.decoder = torch.compile(self.proxy.decoder)
 
         self.ema = EMA(
             self.model,
@@ -171,6 +175,8 @@ class DiffDecLiveDepthTrainer(BaseTrainer):
         
         @torch.no_grad()
         def proxy_encode(batch):
+            if self.no_proxy:
+                return batch
             proxy_z = self.proxy.encoder(batch[:,:3])
             proxy_z = proxy_z / self.train_cfg.ldm_scale # [b,16,45,80]
             return proxy_z
@@ -212,12 +218,13 @@ class DiffDecLiveDepthTrainer(BaseTrainer):
                     if self.total_step_counter % self.train_cfg.sample_interval == 0:
                         with ctx:
                             cfg_scale = getattr(self.train_cfg, 'cfg_scale', 1.0)
-                            ema_rec = flow_sample(
+                            sample_fn = flow_sample if not self.model_cfg.x0_mode else x0_sample
+                            ema_rec = sample_fn(
                                 self.get_ema_core(),
                                 proxy_z,
                                 teacher_z,
                                 self.train_cfg.sampling_steps,
-                                self.proxy.decoder,
+                                self.proxy.decoder if not self.no_proxy else None,
                                 scaling_factor = self.train_cfg.ldm_scale,
                                 cfg_scale = cfg_scale
                             )
