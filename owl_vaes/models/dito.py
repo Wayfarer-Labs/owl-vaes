@@ -95,9 +95,13 @@ class DiTo(nn.Module):
         self.encoder = Encoder(config)
 
         decoder_config = deepcopy(config)
-        decoder_config.channels = config.channels + config.latent_channels
-        
+        decoder_config.channels = config.proxy_channels + config.latent_channels
+        decoder_config.sample_size = config.proxy_sample_size
+
         self.decoder = DiTODecoder(decoder_config)
+
+        self.x0_mode = getattr(config, "x0_mode", True)
+        self.noise_scale = getattr(config, "noise_scale", 1.0)
 
     @torch.no_grad()
     def sample_timesteps(self, b, device, dtype):
@@ -105,9 +109,12 @@ class DiTo(nn.Module):
         ts = torch.rand(b, device=device, dtype=dtype)
         return ts
 
-    def forward(self, x):
+    def forward(self, x, proxy = None):
         z = self.encoder(x)
         z_original = z.clone()
+
+        if proxy is not None:
+            x = proxy
 
         # Noise sync and then timesteps
         with torch.no_grad():
@@ -126,21 +133,32 @@ class DiTo(nn.Module):
 
             ts = self.sample_timesteps(len(x), x.device, x.dtype)
 
+            # Sync mask => x should be just as noisy as z
+            # In x0 mode, x(0) is noise, x(1) is image
+            # In flow mode, x(0) is image, x(1) is noise
             ts = torch.where(
                 sync_mask,
                 ts,
-                ts * tau
+                ts * tau if self.x0_mode else (1 - ts * tau)
             )
             eps_x = torch.randn_like(x)
             ts_exp = ts.view(-1, 1, 1, 1).expand_as(x)
-            noisy_x = ts_exp * x + (1. - ts_exp) * eps_x
 
-            den = (1. - ts_exp).clamp(min=0.05)
-            target = (x - noisy_x) / den
+            if self.x0_mode:
+                noisy_x = ts_exp * x + (1. - ts_exp) * eps_x
+                den = (1. - ts_exp).clamp(min=0.05)
+                target = (x - noisy_x) / den
+            else:
+                noisy_x = x * (1. - ts_exp) + ts_exp * eps_x
+                target = eps_x - x
 
-        noisy_z = tau_exp * z + (1. - tau_exp) * eps_z
-        pred = self.decoder(noisy_x, noisy_z, ts)
-        pred = (pred - noisy_x) / den
+        if self.x0_mode:
+            noisy_z = tau_exp * z + (1. - tau_exp) * eps_z
+            pred = self.decoder(noisy_x, noisy_z, ts)
+            pred = (pred - noisy_x) / den
+        else:
+            noisy_z = z * (1. - tau_exp) + tau_exp * eps_z
+            pred = self.decoder(noisy_z, z, ts)
         loss = F.mse_loss(pred, target)
 
         return loss, z_original

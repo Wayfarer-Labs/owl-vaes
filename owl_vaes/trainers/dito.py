@@ -53,6 +53,13 @@ class DiToTrainer(BaseTrainer):
 
         self.total_step_counter = 0
 
+        self.use_proxy = getattr(self.train_cfg, "use_proxy", False)
+        if self.use_proxy:
+            from diffusers import AutoModel
+            self.proxy = AutoModel.from_pretrained("madebyollin/taef1")
+            self.proxy = self.proxy.to(self.device).bfloat16()
+            self.proxy.encoder = torch.compile(self.proxy.encoder)
+
     def save(self):
         save_dict = {
             'model' : self.model.state_dict(),
@@ -121,9 +128,10 @@ class DiToTrainer(BaseTrainer):
                 total_loss = 0.
                 batch = batch.to(self.device).bfloat16()
                 batch = F.interpolate(batch, self.model_input_size, mode='bilinear', align_corners=False)
+                proxy_batch = self.proxy.encoder(batch) if self.use_proxy else None
 
                 with ctx:
-                    diff_loss, z = self.model(batch)
+                    diff_loss, z = self.model(batch, proxy = proxy_batch)
 
                 metrics.log('diff_loss', diff_loss)
                 total_loss += diff_loss
@@ -148,12 +156,13 @@ class DiToTrainer(BaseTrainer):
 
                     if self.total_step_counter % self.train_cfg.sample_interval == 0:
                         with ctx:
-                            sample_fn = x0_sample
+                            sample_fn = x0_sample if self.model_cfg.x0_mode else flow_sample
                             ema_rec = sample_fn(
                                 self.get_ema_core(),
-                                batch.detach(),
+                                proxy_batch.detach() if self.use_proxy else batch.detach(),
                                 z.detach(),
-                                self.train_cfg.sampling_steps
+                                self.train_cfg.sampling_steps,
+                                self.proxy.decoder if self.use_proxy else None
                             )
 
                         wandb_dict['samples'] = to_wandb(
