@@ -16,12 +16,9 @@ def get_model_cls(model_id: str) -> Any:
     if model_id == "distill_vae":
         from .distill_vae import DistillVAE
         return DistillVAE
-    if model_id == "causal_dcae":
-        from .causal_dcae import CausalDCAE
-        return CausalDCAE
-    if model_id == "causal_audio":
-        from .causal_audio import CausalAudioVAE
-        return CausalAudioVAE
+    #if model_id == "causal_audio":
+    #    from .causal_audio import CausalAudioVAE
+    #    return CausalAudioVAE
     if model_id == "video_dcae":
         from .video_dcae import VideoDCAE
         return VideoDCAE
