@@ -94,9 +94,12 @@ class DiTo(nn.Module):
         config.normalize_mu = True
         self.encoder = Encoder(config)
 
+        proxy_channels = getattr(config, "proxy_channels", config.channels)
+        proxy_sample_size = getattr(config, "proxy_sample_size", config.sample_size)
+
         decoder_config = deepcopy(config)
-        decoder_config.channels = config.proxy_channels + config.latent_channels
-        decoder_config.sample_size = config.proxy_sample_size
+        decoder_config.channels = proxy_channels + config.latent_channels
+        decoder_config.sample_size = proxy_sample_size
 
         self.decoder = DiTODecoder(decoder_config)
 
@@ -158,7 +161,7 @@ class DiTo(nn.Module):
             pred = (pred - noisy_x) / den
         else:
             noisy_z = z * (1. - tau_exp) + tau_exp * eps_z
-            pred = self.decoder(noisy_z, z, ts)
+            pred = self.decoder(noisy_x, noisy_z, ts)
         loss = F.mse_loss(pred, target)
 
         return loss, z_original
