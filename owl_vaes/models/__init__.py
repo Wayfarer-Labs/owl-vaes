@@ -22,4 +22,7 @@ def get_model_cls(model_id: str) -> Any:
     if model_id == "dito":
         from .dito import DiTo
         return DiTo
+    if model_id == "video_dito":
+        from .video_dito import VideoDiTo
+        return VideoDiTo
     return None
