@@ -1,6 +1,7 @@
 import torch
 from torch import nn
-
+import einops as eo
+import torch.nn.functional as F
 import time
 
 def freeze(module : nn.Module):
@@ -75,3 +76,10 @@ def int_to_tuple(x):
             return tuple(x)
         except:
             return [int(i) for i in x]
+
+def video_interpolate(x, *args, **kwargs):
+    b,t,c,h,w = x.shape
+    x = x.reshape(b*t, c, h, w)
+    x = F.interpolate(x, *args, **kwargs)
+    x = x.reshape(b, t, c, *x.shape[2:])
+    return x
