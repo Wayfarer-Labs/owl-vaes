@@ -7,7 +7,6 @@ import einops as eo
 
 from owl_vaes.configs import TransformerConfig
 
-from .mimetic import mimetic_init
 from .mlp import MLP
 from .normalization import LayerNorm, QKNorm
 from .rope import get_rope_impl
@@ -204,9 +203,7 @@ def attn_test():
         n_layers = 6,
         n_heads = 6,
         d_model = 384,
-        patch_size = 1,
-        causal = False,
-        mimetic_init = False
+        patch_size = 1
     )
 
     # Test Attention layer

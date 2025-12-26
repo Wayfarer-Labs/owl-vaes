@@ -2,14 +2,22 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from copy import deepcopy
+import einops as eo
+
 from .video_dcae import Encoder
 from ..utils import video_interpolate
+
+from ..nn.attn import get_attn_mask
+from ..nn.embeddings import TimestepEmbedding
+from ..nn.dit import DiT, FinalLayer
+from ..utils import int_to_tuple
 
 class VideoDiTODecoder(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        config.rope_impl = 'image'
+        config.rope_impl = 'video'
         size = config.sample_size
         patch_size = config.patch_size
         if isinstance(patch_size, int):
@@ -28,6 +36,7 @@ class VideoDiTODecoder(nn.Module):
         self.p_y, self.p_x = patch_size
         self.n_p_y = config.sample_size[0] // self.p_y
         self.n_p_x = config.sample_size[1] // self.p_x
+        self.n_frames = config.n_frames
         self.temporal_factor = getattr(config, "temporal_factor", 4)
 
     def forward(self, x, z, ts, attn_mask = None):
@@ -52,14 +61,12 @@ class VideoDiTODecoder(nn.Module):
 
         ts_flat = eo.rearrange(ts, 'b n -> (b n)')
         cond = self.ts_embed(ts_flat)
-        cond = eo.rearrange(cond, '(b n) -> b n', b = b)
+        cond = eo.rearrange(cond, '(b n) d -> b n d', b = b)
 
-        # z needs to be cast to x so that we can cast properly
+        # z needs to be made same shape as x for concat
         z = video_interpolate(z, size=x.shape[-2:], mode='bilinear', align_corners=False) # first spatially
         z = eo.repeat(z, 'b n c h w -> b (n f) c h w', f = self.temporal_factor) # then temporally
 
-        # Convert from image format [b,c,h,w] to patches [b,n_patches,patch_size*patch_size*c]
-        z = F.interpolate(z, size=x.shape[-2:], mode='bilinear', align_corners=False)
         orig_c = x.shape[2]
         x = torch.cat([x, z], dim=2)
 

@@ -43,6 +43,12 @@ def unbatch(x, b):
     x = x.reshape(b, -1, c, h, w)
     return x
 
+def latent_ln(z, eps=1e-6):
+    # z: [b, c, h, w]
+    mean = z.mean(dim=(1, 2, 3), keepdim=True)
+    var  = z.var(dim=(1, 2, 3), keepdim=True, unbiased=False)
+    return (z - mean) / torch.sqrt(var + eps)
+
 class Encoder(nn.Module):
     def __init__(self, config : 'ResNetConfig'):
         super().__init__()
@@ -95,6 +101,7 @@ class Encoder(nn.Module):
             TemporalDownsample(min(ch_0 * 8, ch_max)),
             nn.Identity(),
         ])
+        self.normalize_mu = getattr(config, 'normalize_mu', False)
 
     def forward(self, x, kv_cache = None, attn_mask = None):
         if attn_mask is None:
@@ -119,6 +126,8 @@ class Encoder(nn.Module):
             x = batch(x)
 
         mu = self.conv_out(x)
+        if self.normalize_mu:
+            mu = latent_ln(mu)
         mu = unbatch(mu, b)
 
         if not self.training:
