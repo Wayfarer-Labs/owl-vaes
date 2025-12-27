@@ -19,7 +19,16 @@ run: |
   # Get the head node IP
   MASTER_ADDR=$(echo "$SKYPILOT_NODE_IPS" | head -n1)
   echo "Starting distributed training, head node: $MASTER_ADDR"
-  
+
+  # NCCL optimizations for socket-based communication
+  export NCCL_SOCKET_IFNAME=eth0  # Use ethernet interface
+  export NCCL_IB_DISABLE=1         # Disable InfiniBand to force sockets
+  export NCCL_P2P_DISABLE=0        # Enable P2P for intra-node
+  export NCCL_SHM_DISABLE=0        # Enable shared memory for intra-node
+  export NCCL_SOCKET_NTHREADS=4    # More threads for socket operations
+  export NCCL_NSOCKS_PERTHREAD=4   # More sockets per thread
+  export NCCL_BUFFSIZE=2097152     # 2MB buffer size for better throughput
+
   # Run distributed training with torchrun
   torchrun \
     --nnodes=$SKYPILOT_NUM_NODES \
