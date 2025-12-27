@@ -281,7 +281,7 @@ class VideoRoPE(nn.Module):
             n_p_y = self.n_p_y,
             n_p_x = self.n_p_x,
         )
-        x = apply_rotary_emb(self.freqs[-x.shape[2]:].detach().float(), x.float()).to(x.dtype)
+        x = apply_rotary_emb(self.freqs[:x.shape[2]].detach().float(), x.float()).to(x.dtype)
         x = eo.rearrange(
             x,
             'b h n_frames n_p_y n_p_x d -> b h (n_frames n_p_y n_p_x) d',

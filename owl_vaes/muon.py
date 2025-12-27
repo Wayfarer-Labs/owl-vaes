@@ -146,7 +146,8 @@ class CombinedOptimizer(Optimizer):
             lr=kwargs.get('lr'),
             momentum=kwargs.get('momentum'),
             rank = rank,
-            world_size = world_size
+            world_size = world_size,
+            weight_decay=kwargs.get('muon_wd', 0.01)
         )
 
         # For LR scheduler compatibility

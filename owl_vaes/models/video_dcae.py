@@ -96,12 +96,13 @@ class Encoder(nn.Module):
 
         # TODO, this is sloppy
         self.down = nn.ModuleList([
-            nn.Identity(),
+            TemporalDownsample(min(ch_0 * 2, ch_max)),
             TemporalDownsample(min(ch_0 * 4, ch_max)),
-            TemporalDownsample(min(ch_0 * 8, ch_max)),
+            nn.Identity(),
             nn.Identity(),
         ])
         self.normalize_mu = getattr(config, 'normalize_mu', False)
+        self.clamp_mu = getattr(config, 'clamp_mu', False)
 
     def forward(self, x, kv_cache = None, attn_mask = None):
         if attn_mask is None:
@@ -128,6 +129,8 @@ class Encoder(nn.Module):
         mu = self.conv_out(x)
         if self.normalize_mu:
             mu = latent_ln(mu)
+        if self.clamp_mu:
+            mu = torch.clamp(mu, -8.0, 8.0)
         mu = unbatch(mu, b)
 
         if not self.training:

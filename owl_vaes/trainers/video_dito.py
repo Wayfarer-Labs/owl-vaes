@@ -68,18 +68,23 @@ class VideoDiToTrainer(BaseTrainer):
             'scaler' : self.scaler.state_dict(),
             'steps': self.total_step_counter
         }
+        if self.scheduler is not None:
+            save_dict['scheduler'] = self.scheduler.state_dict()
         super().save(save_dict)
 
     def load(self):
         if not hasattr(self.train_cfg, 'resume_ckpt') or self.train_cfg.resume_ckpt is None:
             return
-        
+
         save_dict = super().load(self.train_cfg.resume_ckpt)
         self.model.load_state_dict(save_dict['model'])
         self.ema.load_state_dict(save_dict['ema'])
         self.opt.load_state_dict(save_dict['opt'])
         self.scaler.load_state_dict(save_dict['scaler'])
         self.total_step_counter = save_dict['steps']
+
+        if self.scheduler is not None and 'scheduler' in save_dict:
+            self.scheduler.load_state_dict(save_dict['scheduler'])
     
     def get_ema_core(self):
         if self.world_size > 1:
@@ -114,6 +119,13 @@ class VideoDiToTrainer(BaseTrainer):
         else:
             opt_cls = getattr(torch.optim, self.train_cfg.opt)
             self.opt = opt_cls(self.model.parameters(), **self.train_cfg.opt_kwargs)
+
+        # Set up scheduler if specified
+        if hasattr(self.train_cfg, 'scheduler') and self.train_cfg.scheduler is not None:
+            scheduler_cls = get_scheduler_cls(self.train_cfg.scheduler)
+            self.scheduler = scheduler_cls(self.opt, **self.train_cfg.scheduler_kwargs)
+        else:
+            self.scheduler = None
 
         self.scaler = torch.amp.GradScaler()
         ctx = torch.amp.autocast(self.device, torch.bfloat16)
@@ -157,15 +169,24 @@ class VideoDiToTrainer(BaseTrainer):
 
                 self.scaler.step(self.opt)
                 self.opt.zero_grad(set_to_none=True)
-                
+
                 self.scaler.update()
                 self.ema.update()
+
+                # Step scheduler if it exists
+                if self.scheduler is not None:
+                    self.scheduler.step()
 
                 # Do logging stuff with sampling stuff in the middle
                 with torch.no_grad():
                     wandb_dict = metrics.pop()
                     wandb_dict['time'] = timer.hit()
                     timer.reset()
+
+                    # Log learning rates
+                    if self.scheduler is not None:
+                        for idx, param_group in enumerate(self.opt.param_groups):
+                            wandb_dict[f'lr/group_{idx}'] = param_group['lr']
 
                     if self.total_step_counter % self.train_cfg.sample_interval == 0:
                         with ctx:

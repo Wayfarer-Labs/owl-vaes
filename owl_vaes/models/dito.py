@@ -92,6 +92,7 @@ class DiTo(nn.Module):
 
         config.skip_logvar = True
         config.normalize_mu = True
+        config.clamp_mu = True
         self.encoder = Encoder(config)
 
         proxy_channels = getattr(config, "proxy_channels", config.channels)
