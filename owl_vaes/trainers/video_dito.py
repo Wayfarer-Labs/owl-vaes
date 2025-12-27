@@ -92,7 +92,12 @@ class VideoDiToTrainer(BaseTrainer):
         # Prepare model, lpips, ema
         self.model = self.model.to(self.device).train()
         if self.world_size > 1:
-            self.model = DDP(self.model, find_unused_parameters=True)
+            self.model = DDP(
+                self.model,
+                find_unused_parameters=False,  # Critical for multi-node performance
+                gradient_as_bucket_view=True,   # Reduces memory copies
+                static_graph=True                # Graph structure doesn't change
+            )
 
         self.ema = EMA(
             self.model,
@@ -184,5 +189,3 @@ class VideoDiToTrainer(BaseTrainer):
                 if self.total_step_counter % self.train_cfg.save_interval == 0:
                     if self.rank == 0:
                         self.save()
-
-                self.barrier()

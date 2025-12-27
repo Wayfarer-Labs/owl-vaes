@@ -11,7 +11,7 @@ def zlerp(x, t):
 
 @torch.no_grad()
 def causal_x0_sample(
-    decoder,
+    model,
     dummy, 
     z, 
     steps,
@@ -75,7 +75,7 @@ def causal_x0_sample(
         for step_idx in range(steps):
             # V Prediction for just the last chunk
             den = (1. - ts).clamp(min=0.05)[:,-chunk_size:] # [b,chunk_size]
-            pred_x0 = decoder(context, z_slice, ts)[:,-chunk_size:]
+            pred_x0 = model(context, z_slice, ts)[:,-chunk_size:]
             v_pred = (pred_x0 - context[:,-chunk_size:]) / den.view(den.shape[0],den.shape[1],1,1,1).expand_as(pred_x0)
             
             context[:,-chunk_size:] = context[:,-chunk_size:] + dt * v_pred
@@ -84,7 +84,7 @@ def causal_x0_sample(
         # Once denoised, add new frame to generated frames
         # And update context to be partially noised
         generated_frames.append(context[:,-chunk_size:].clone())
-        context[:,-chunk_size:] = zlerp(context[:,-chunk_size:], 1 - prev_signal)
+        context[:,-chunk_size:] = zlerp(context[:,-chunk_size:], prev_signal)
         ts[:,-chunk_size:] = ts[:,-chunk_size:] * prev_signal
 
     generated_frames = torch.cat(generated_frames, dim = 1).clamp(-1,1)

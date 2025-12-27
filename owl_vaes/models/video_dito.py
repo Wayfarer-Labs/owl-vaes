@@ -115,6 +115,7 @@ class VideoDiTo(nn.Module):
 
         self.x0_mode = getattr(config, "x0_mode", True)
         self.noise_scale = getattr(config, "noise_scale", 1.0)
+        self.temporal_factor = getattr(config, "temporal_factor", 4)
 
     @torch.no_grad()
     def sample_timesteps(self, b, n, device, dtype):
@@ -143,20 +144,22 @@ class VideoDiTo(nn.Module):
                 tau_signal
             )
             eps_z = torch.randn_like(z)
-            tau_exp = tau.view(-1, -1, 1, 1, 1).expand_as(z)
+            tau_exp = tau.view(tau.shape[0], tau.shape[1], 1, 1, 1).expand_as(z)
             
             ts = self.sample_timesteps(x.shape[0], x.shape[1], x.device, x.dtype)
+            sync_mask_rep = eo.repeat(sync_mask, 'b n -> b (n f)', f = self.temporal_factor)
+            tau_rep = eo.repeat(tau, 'b n -> b (n f)', f = self.temporal_factor)
 
             # Sync mask => x should be just as noisy as z
             # In x0 mode, x(0) is noise, x(1) is image
             # In flow mode, x(0) is image, x(1) is noise
             ts = torch.where(
-                sync_mask,
+                sync_mask_rep,
                 ts,
-                ts * tau if self.x0_mode else (1 - ts * tau)
+                ts * tau_rep if self.x0_mode else (1 - ts * tau_rep)
             )
             eps_x = torch.randn_like(x)
-            ts_exp = ts.view(-1, -1, 1, 1, 1).expand_as(x)
+            ts_exp = ts.view(ts.shape[0], ts.shape[1], 1, 1, 1).expand_as(x)
 
             if self.x0_mode:
                 noisy_x = ts_exp * x + (1. - ts_exp) * eps_x
