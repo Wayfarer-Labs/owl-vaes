@@ -102,7 +102,7 @@ class VideoDiTo(nn.Module):
 
         config.skip_logvar = True
         config.normalize_mu = True
-        config.clamp_mu = True
+        config.clamp_mu = False
         self.encoder = Encoder(config)
 
         proxy_channels = getattr(config, "proxy_channels", config.channels)
@@ -111,12 +111,17 @@ class VideoDiTo(nn.Module):
         decoder_config = deepcopy(config)
         decoder_config.channels = proxy_channels + config.latent_channels
         decoder_config.sample_size = proxy_sample_size
+        decoder_config.tokens_per_frame = (
+            decoder_config.sample_size[0] // decoder_config.patch_size[0] *
+            decoder_config.sample_size[1] // decoder_config.patch_size[1]
+        )
 
         self.decoder = VideoDiTODecoder(decoder_config)
 
         self.x0_mode = getattr(config, "x0_mode", True)
         self.noise_scale = getattr(config, "noise_scale", 1.0)
         self.temporal_factor = getattr(config, "temporal_factor", 4)
+        self.cfm_weight = getattr(config, "cfm_weight", 0.05)
 
     @torch.no_grad()
     def sample_timesteps(self, b, n, device, dtype):
@@ -178,5 +183,9 @@ class VideoDiTo(nn.Module):
             noisy_z = z * (1. - tau_exp) + tau_exp * eps_z
             pred = self.decoder(noisy_x, noisy_z, ts)
         loss = F.mse_loss(pred, target)
+        if self.cfm_weight > 0:
+            shuffled_target = torch.cat([target[1:], target[:1]], dim = 0) # Shift target by 1 on batch dim
+            cfm_loss = F.mse_loss(pred, shuffled_target)
+            loss = loss + self.cfm_weight * cfm_loss
 
         return loss, z_original

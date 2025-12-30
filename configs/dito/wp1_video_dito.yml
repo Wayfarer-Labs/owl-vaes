@@ -6,23 +6,23 @@ model:
   latent_size: 32
   latent_channels: 16
 
-  ch_0: 64
-  ch_max: 512
+  ch_0: 96
+  ch_max: 384
 
-  encoder_blocks_per_stage: [2, 4, 4, 4]
-  decoder_blocks_per_stage: [2, 4, 4, 4]
+  encoder_blocks_per_stage: [2, 2, 2, 2]
+  decoder_blocks_per_stage: [2, 2, 2, 2]
 
   use_middle_block: false
   do_channel_mask: false
 
   n_layers: 24
-  n_heads: 24
-  d_model: 1536
+  n_heads: 16
+  d_model: 1024
 
   patch_size: [20, 20]
   x0_mode: true
   temporal_factor: 4
-  n_frames: 8
+  n_frames: 16
    
   tokens_per_frame: 256
   rope_impl: video
@@ -36,7 +36,7 @@ train:
      - /mnt/data/datasets/extracted_tars/kbm/3ps/*/*.mp4
      - /mnt/data/datasets/extracted_tars/kbm/other/*/*.mp4
     target_size: [360, 640]
-    window_length: 8
+    window_length: 16
 
   target_batch_size: 64
   batch_size: 2
@@ -65,12 +65,18 @@ train:
       - .gate1
       - .gate2
 
-  scheduler: null
+  scheduler: LinearWarmupWithCosineDecay
+  scheduler_kwargs:
+    warmup_steps: 1000
+    decay_after: 120000
+    decay_steps: 220000
+    start_mult: 0.1
+    decay_to_mult: 0.1
 
   checkpoint_dir: checkpoints/waypoint_1_video_dito_owlc_f16_c16
   resume_ckpt: null #checkpoints/waypoint_1_vae_owlc_f16_c16/step_200000.pt
 
-  sample_interval: 50
+  sample_interval: 250
   save_interval: 5000
 
   sampling_steps: 25
