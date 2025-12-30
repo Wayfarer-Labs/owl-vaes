@@ -90,6 +90,80 @@ def causal_x0_sample(
     generated_frames = torch.cat(generated_frames, dim = 1).clamp(-1,1)
     return generated_frames
 
+@torch.no_grad()
+def all_at_once_x0_sample(
+    model,
+    dummy, 
+    z, 
+    steps,
+    progress_bar = True,
+    prev_signal = 0.85
+):
+    """
+    Unlike the above, diffuses entire video at once, but still does frame-by-frame to maximize quality.
+
+    :param dummy: Dummy video tensor that matches shape of what we want to generate. We will assume this maxes models max frames
+    :param z: Latent tensor of shape [b,n,c,h,w] where is n is length of dummy as well but divided by some factor
+    """
+    generated_frames = []
+    n_chunks = dummy.shape[1] // model.temporal_factor
+    chunk_size = model.temporal_factor
+
+    dt = 1. / steps
+
+    # Step 1: Generate the first chunk of frames
+
+    max_q = model.n_p_y * model.n_p_x  * model.n_frames
+    max_kv = max_q
+
+    attn_mask = get_attn_mask(
+        model.config,
+        batch_size = z.shape[0],
+        device = z.device,
+        max_q_len = max_q,
+        max_kv_len = max_kv,
+        kernel_size = int_to_tuple(getattr(model.config, "kernel", None)) 
+    )
+
+    context = torch.randn_like(dummy)
+    ts = torch.zeros(
+        dummy.shape[0],
+        dummy.shape[1],
+        device = dummy.device,
+        dtype = dummy.dtype,
+    )
+
+    for chunk_idx in tqdm(range(n_chunks), disable = not progress_bar):
+        # Make noise and ts for next chunk, get all relevant z up to now
+        frame_idx = chunk_idx * chunk_size
+
+        # Current chunk is noised without touching preceeding chunks
+        # Preceeding chunks are lerped to prev_signal
+        prev_idx = max(0, frame_idx - chunk_size)
+        ts[:,:frame_idx] = prev_signal
+        context[:,prev_idx:frame_idx] = zlerp(context[:,prev_idx:frame_idx], prev_signal)
+
+        # Future chunks are pure noise
+        ts[:,frame_idx:] = 0.0
+        context[:,frame_idx:] = torch.randn_like(context[:,frame_idx:])
+
+        # Denoising loop
+        for step_idx in range(steps):
+            # V Prediction for just the last chunk
+            den = (1. - ts).clamp(min=0.05) # [b,chunk_size]
+            pred_x0 = model(context, z, ts)
+            v_pred = (pred_x0 - context) / den.view(den.shape[0],den.shape[1],1,1,1).expand_as(pred_x0)
+
+            context[:,frame_idx:] = context[:,frame_idx:] + dt * v_pred[:,frame_idx:]
+            ts[:,frame_idx:] = ts[:,frame_idx:] + dt
+            
+        # Once denoised, add new frame to generated frames
+        # And update context to be partially noised
+        generated_frames.append(context[:,frame_idx:frame_idx+chunk_size].clone())
+
+    generated_frames = torch.cat(generated_frames, dim = 1).clamp(-1,1)
+    return generated_frames
+
 if __name__ == "__main__":
     from ..models.video_dito import VideoDiTo
     from ..configs import Config
@@ -105,5 +179,5 @@ if __name__ == "__main__":
     z = torch.randn(1, 4, 16, 32, 32).cuda().bfloat16()
 
     with torch.inference_mode():
-        samples = causal_x0_sample(model, dummy, z, 25)
+        samples = all_at_once_x0_sample(model, dummy, z, 25)
     print(samples.shape)
