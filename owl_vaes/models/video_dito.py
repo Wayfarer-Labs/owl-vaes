@@ -8,7 +8,7 @@ import einops as eo
 from .video_dcae import Encoder
 from ..utils import video_interpolate
 
-from ..nn.attn import get_attn_mask
+from ..nn.video_ae import get_frame_causal_attn_mask
 from ..nn.embeddings import TimestepEmbedding
 from ..nn.dit import DiT, FinalLayer
 from ..utils import int_to_tuple
@@ -50,7 +50,7 @@ class VideoDiTODecoder(nn.Module):
             max_q = self.n_p_y * self.n_p_x * self.n_frames
             max_kv = max_q
 
-            attn_mask = get_attn_mask(
+            attn_mask = get_frame_causal_attn_mask(
                 self.config,
                 batch_size = x.shape[0],
                 device = x.device,
@@ -100,10 +100,14 @@ class VideoDiTo(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        config.skip_logvar = True
-        config.normalize_mu = True
-        config.clamp_mu = False
-        self.encoder = Encoder(config)
+        encoder_config = deepcopy(config)
+        encoder_config.skip_logvar = True
+        encoder_config.normalize_mu = True
+        encoder_config.clamp_mu = True
+        encoder_config.d_model = 768
+        encoder_config.n_heads = 12
+        encoder_config.encoder_kernel = getattr(config, 'encoder_kernel', None)
+        self.encoder = Encoder(encoder_config)
 
         proxy_channels = getattr(config, "proxy_channels", config.channels)
         proxy_sample_size = getattr(config, "proxy_sample_size", config.sample_size)
@@ -115,6 +119,7 @@ class VideoDiTo(nn.Module):
             decoder_config.sample_size[0] // decoder_config.patch_size[0] *
             decoder_config.sample_size[1] // decoder_config.patch_size[1]
         )
+        decoder_config.kernel = getattr(config, 'decoder_kernel', None)
 
         self.decoder = VideoDiTODecoder(decoder_config)
 
@@ -185,7 +190,7 @@ class VideoDiTo(nn.Module):
         loss = F.mse_loss(pred, target)
         if self.cfm_weight > 0:
             shuffled_target = torch.cat([target[1:], target[:1]], dim = 0) # Shift target by 1 on batch dim
-            cfm_loss = F.mse_loss(pred, shuffled_target)
+            cfm_loss = -1 * F.mse_loss(pred, shuffled_target)
             loss = loss + self.cfm_weight * cfm_loss
 
         return loss, z_original

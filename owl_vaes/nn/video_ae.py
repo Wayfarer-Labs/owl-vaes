@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import create_block_mask
 
 import math
 import einops as eo
@@ -96,36 +97,56 @@ def get_frame_causal_attn_mask(
     max_kv_len = 1024,
     kernel_size = None,
 ):
+    # Calculate actual patch grid dimensions from sample_size and patch_size
+    h, w = int_to_tuple(config.sample_size)
+    p_y, p_x = int_to_tuple(config.patch_size)
+    n_p_y = h // p_y  # Number of patches vertically
+    n_p_x = w // p_x  # Number of patches horizontally
+    tokens_per_frame = n_p_y * n_p_x
+
     if kernel_size is not None:
         k_y, k_x = int_to_tuple(kernel_size)
 
     def frame_idx(idx):
-        return idx // (config.tokens_per_frame)
-    
+        return idx // tokens_per_frame
+
     def row_idx(idx):
-        idx = idx % (config.tokens_per_frame)
-        idx = idx // int(config.tokens_per_frame ** .5)
+        idx = idx % tokens_per_frame
+        idx = idx // n_p_x
         return idx
-    
+
     def col_idx(idx):
-        idx = idx % (config.tokens_per_frame)
-        idx = idx % int(config.tokens_per_frame ** .5)
+        idx = idx % tokens_per_frame
+        idx = idx % n_p_x
         return idx
 
     def can_attend_to(b,h,idx_i, idx_j):
         frame_idx_i = frame_idx(idx_i)
-        row_idx_i = row_idx(idx_i)
-        col_idx_i = col_idx(idx_i)
-
         frame_idx_j = frame_idx(idx_j)
-        row_idx_j = row_idx(idx_j)
-        col_idx_j = col_idx(idx_j)
+
         if kernel_size is None:
             return frame_idx_j <= frame_idx_i
         else:
+            row_idx_i = row_idx(idx_i)
+            col_idx_i = col_idx(idx_i)
+
+            row_idx_j = row_idx(idx_j)
+            col_idx_j = col_idx(idx_j)
+
             causal_mask = (frame_idx_j <= frame_idx_i)
             image_nbr_mask = (torch.abs(row_idx_j - row_idx_i) <= k_y) & (torch.abs(col_idx_j - col_idx_i) <= k_x)
-            return causal_mask & image_nbr_mask
+            mask = image_nbr_mask & causal_mask
+            return mask
+
+    return create_block_mask(
+        can_attend_to,
+        B=batch_size,
+        H=config.n_heads,
+        Q_LEN=max_q_len,
+        KV_LEN=max_kv_len,
+        device=device,
+    )
+
 
 class CausalFrameAttn(nn.Module):
     """

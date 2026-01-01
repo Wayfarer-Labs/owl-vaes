@@ -21,7 +21,7 @@ from ..utils import Timer, freeze, unfreeze, versatile_load, video_interpolate
 from ..utils.logging import LogHelper, to_wandb_video_sidebyside
 from .base import BaseTrainer
 from ..configs import Config
-from ..sampling.video_dito import causal_x0_sample
+from ..sampling.video_dito import causal_x0_sample, causal_v_sample
 
 class VideoDiToTrainer(BaseTrainer):
     """
@@ -190,7 +190,7 @@ class VideoDiToTrainer(BaseTrainer):
 
                     if self.total_step_counter % self.train_cfg.sample_interval == 0:
                         with ctx:
-                            sample_fn = causal_x0_sample
+                            sample_fn = causal_x0_sample if self.model_cfg.x0_mode else causal_v_sample
                             ema_rec = sample_fn(
                                 self.get_ema_core(),
                                 batch.detach(),

@@ -5,9 +5,12 @@ import einops as eo
 from ..nn.attn import get_attn_mask
 from ..utils import int_to_tuple
 
-def zlerp(x, t):
+def zlerp(x, t, reverse = True):
     eps = torch.randn_like(x)
-    return x * t + (1. - t) * eps
+    if reverse:
+        return x * t + (1. - t) * eps
+    else:
+        return x * (1. - t) + t * eps
 
 @torch.no_grad()
 def causal_x0_sample(
@@ -91,16 +94,20 @@ def causal_x0_sample(
     return generated_frames
 
 @torch.no_grad()
-def all_at_once_x0_sample(
+def causal_v_sample(
     model,
     dummy, 
     z, 
     steps,
     progress_bar = True,
-    prev_signal = 0.85
+    prev_noise = 0.15
 ):
     """
-    Unlike the above, diffuses entire video at once, but still does frame-by-frame to maximize quality.
+    Sample video from latents given diffusion decoder. Assumes outputs are v predictions.
+    """
+    """
+    Sample video from latents given diffusion decoder.
+    Note this specific sampler can't take controls, but that's fine.
 
     :param dummy: Dummy video tensor that matches shape of what we want to generate. We will assume this maxes models max frames
     :param z: Latent tensor of shape [b,n,c,h,w] where is n is length of dummy as well but divided by some factor
@@ -125,41 +132,45 @@ def all_at_once_x0_sample(
         kernel_size = int_to_tuple(getattr(model.config, "kernel", None)) 
     )
 
-    context = torch.randn_like(dummy)
-    ts = torch.zeros(
+    context = torch.empty(
         dummy.shape[0],
-        dummy.shape[1],
+        0,
+        dummy.shape[2],
+        dummy.shape[3],
+        dummy.shape[4],
+        device = dummy.device,
+        dtype = dummy.dtype,
+    )
+    ts = torch.empty(
+        dummy.shape[0],
+        0,
         device = dummy.device,
         dtype = dummy.dtype,
     )
 
     for chunk_idx in tqdm(range(n_chunks), disable = not progress_bar):
         # Make noise and ts for next chunk, get all relevant z up to now
-        frame_idx = chunk_idx * chunk_size
+        noisy = torch.randn_like(dummy[:,:chunk_size])
+        noisy_ts = torch.ones(dummy.shape[0], chunk_size, device = dummy.device, dtype = dummy.dtype)
+        z_slice = z[:,:chunk_idx+1].contiguous()
 
-        # Current chunk is noised without touching preceeding chunks
-        # Preceeding chunks are lerped to prev_signal
-        prev_idx = max(0, frame_idx - chunk_size)
-        ts[:,:frame_idx] = prev_signal
-        context[:,prev_idx:frame_idx] = zlerp(context[:,prev_idx:frame_idx], prev_signal)
-
-        # Future chunks are pure noise
-        ts[:,frame_idx:] = 0.0
-        context[:,frame_idx:] = torch.randn_like(context[:,frame_idx:])
+        # concat to get ready
+        context = torch.cat([context, noisy], dim = 1)
+        ts = torch.cat([ts, noisy_ts], dim = 1)
 
         # Denoising loop
         for step_idx in range(steps):
             # V Prediction for just the last chunk
-            den = (1. - ts).clamp(min=0.05) # [b,chunk_size]
-            pred_x0 = model(context, z, ts)
-            v_pred = (pred_x0 - context) / den.view(den.shape[0],den.shape[1],1,1,1).expand_as(pred_x0)
-
-            context[:,frame_idx:] = context[:,frame_idx:] + dt * v_pred[:,frame_idx:]
-            ts[:,frame_idx:] = ts[:,frame_idx:] + dt
+            v_pred = model(context, z_slice, ts)[:,-chunk_size:]
             
+            context[:,-chunk_size:] = context[:,-chunk_size:] - dt * v_pred
+            ts[:,-chunk_size:] = ts[:,-chunk_size:] - dt
+        
         # Once denoised, add new frame to generated frames
         # And update context to be partially noised
-        generated_frames.append(context[:,frame_idx:frame_idx+chunk_size].clone())
+        generated_frames.append(context[:,-chunk_size:].clone())
+        context[:,-chunk_size:] = zlerp(context[:,-chunk_size:], prev_signal)
+        ts[:,-chunk_size:] = ts[:,-chunk_size:] * prev_noise
 
     generated_frames = torch.cat(generated_frames, dim = 1).clamp(-1,1)
     return generated_frames
@@ -171,9 +182,18 @@ if __name__ == "__main__":
 
     cfg_path = "configs/dito/wp1_video_dito.yml"
     cfg = Config.from_yaml(cfg_path).model
-    model = VideoDiTo(cfg).decoder
+    model = VideoDiTo(cfg)
+    encoder = model.encoder
+    model = model.decoder
     model = model.cuda().bfloat16()
+    encoder = encoder.cuda().bfloat16()
     #model = torch.compile(model)
+
+    rgb = torch.randn(1, 16, 3, 360, 640).cuda().bfloat16()
+    with torch.no_grad():
+        z = encoder(rgb)
+    print(z.shape)
+    exit()
 
     dummy = torch.randn(1, 16, 3, 360, 640).cuda().bfloat16()
     z = torch.randn(1, 4, 16, 32, 32).cuda().bfloat16()

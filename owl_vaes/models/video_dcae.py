@@ -76,12 +76,12 @@ class Encoder(nn.Module):
         blocks_per_stage = config.encoder_blocks_per_stage
         total_blocks = len(blocks_per_stage)
 
-        for block_count in blocks_per_stage:
+        for i, block_count in enumerate(blocks_per_stage):
             next_ch = min(ch*2, ch_max)
 
             blocks.append(DownBlock(ch, next_ch, block_count, total_blocks))
             residuals.append(SpaceToChannel(ch, next_ch))
-            attn_blocks.append(CausalFrameAttn(next_ch, attn_config))
+            attn_blocks.append(CausalFrameAttn(next_ch, attn_config) if i > 1 else nn.Identity())
 
             ch = next_ch
 
@@ -96,23 +96,30 @@ class Encoder(nn.Module):
 
         # TODO, this is sloppy
         self.down = nn.ModuleList([
-            TemporalDownsample(min(ch_0 * 2, ch_max)),
+            nn.Identity(),
+            nn.Identity(),
             TemporalDownsample(min(ch_0 * 4, ch_max)),
-            nn.Identity(),
-            nn.Identity(),
+            TemporalDownsample(min(ch_0 * 4, ch_max)),
+            #nn.Identity(),
+            #nn.Identity(),
         ])
         self.normalize_mu = getattr(config, 'normalize_mu', False)
         self.clamp_mu = getattr(config, 'clamp_mu', False)
+        self.n_frames = getattr(config, 'n_frames', 1)
 
     def forward(self, x, kv_cache = None, attn_mask = None):
         if attn_mask is None:
+            # Calculate actual sequence length: frames * tokens_per_frame
+            tokens_per_frame = self.config.tokens_per_frame
+            seq_len = self.n_frames * tokens_per_frame
+
             attn_mask = get_frame_causal_attn_mask(
                 self.config,
                 batch_size = x.shape[0],
                 device = x.device,
-                max_q_len = x.shape[1],
-                max_kv_len = x.shape[1],
-                kernel_size = getattr(self.config, "kernel", None)
+                max_q_len = seq_len,
+                max_kv_len = seq_len,
+                kernel_size = getattr(self.config, "encoder_kernel", None)
             )
 
         b = x.shape[0]
@@ -122,15 +129,16 @@ class Encoder(nn.Module):
             res = shortcut(x)
             x = block(x) + res
             x = unbatch(x, b)
-            x = attn(x, kv_cache, attn_mask)
-            x = down(x)
+            if i > 1:
+                x = attn(x, kv_cache, attn_mask)
+                x = down(x)
             x = batch(x)
 
         mu = self.conv_out(x)
         if self.normalize_mu:
             mu = latent_ln(mu)
         if self.clamp_mu:
-            mu = torch.clamp(mu, -8.0, 8.0)
+            mu = torch.clamp(mu, -15.0, 15.0)
         mu = unbatch(mu, b)
 
         if not self.training:
@@ -192,16 +200,21 @@ class Decoder(nn.Module):
             TemporalUpsample(min(ch_0 * 4, ch_max)),
             nn.Identity(),
         ])
+        self.n_frames = getattr(config, 'n_frames', 1)
 
     def forward(self, x, kv_cache = None, attn_mask = None):
         if attn_mask is None:
+            # Calculate actual sequence length: frames * tokens_per_frame
+            tokens_per_frame = self.config.tokens_per_frame
+            seq_len = self.n_frames * tokens_per_frame
+
             attn_mask = get_frame_causal_attn_mask(
                 self.config,
                 batch_size = x.shape[0],
                 device = x.device,
-                max_q_len = x.shape[1],
-                max_kv_len = x.shape[1],
-                kernel_size = getattr(self.config, "kernel", None)
+                max_q_len = seq_len,
+                max_kv_len = seq_len,
+                kernel_size = getattr(self.config, "decoder_kernel", None)
             )
 
         b = x.shape[0]

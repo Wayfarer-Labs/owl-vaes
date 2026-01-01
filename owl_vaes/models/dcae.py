@@ -105,7 +105,7 @@ class Encoder(nn.Module):
                 return mu
 
             logvar = self.conv_out_logvar(x)
-            logvar = logvar.repeat(1, self.latent_channels, 1, 1)
+            logvar = logvar.repeat(1, self.latent_channels, 1, 1).contiguous()
 
             return mu, logvar
 
