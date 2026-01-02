@@ -282,6 +282,8 @@ class SerDistillDecTrainer(BaseTrainer):
         def warmup_weight():
             if self.total_step_counter < self.train_cfg.delay_adv:
                 return 0.0
+            elif self.train_cfg.warmup_adv == 0:
+                return 1.0
             else:
                 x = (self.total_step_counter - self.train_cfg.delay_adv) / self.train_cfg.warmup_adv
                 x = max(0.0, min(1.0, x))
@@ -346,7 +348,7 @@ class SerDistillDecTrainer(BaseTrainer):
                         self.discriminator.eval()
                         crnt_gan_weight = warmup_gan_weight()
                         if crnt_gan_weight > 0.0:
-                            gan_loss = ser_g_loss(self.discriminator, batch_rec, batch.detach(), teacher_z.detach())
+                            gan_loss = ser_g_loss(self.discriminator, batch, batch_rec, teacher_z.detach())
                             gan_loss = gan_loss / accum_steps
                             metrics.log('gan_loss', gan_loss)
                             total_loss += crnt_gan_weight * gan_loss

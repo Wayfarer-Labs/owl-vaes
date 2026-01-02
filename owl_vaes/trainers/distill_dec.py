@@ -54,10 +54,10 @@ class DistillDecTrainer(BaseTrainer):
         teacher = get_model_cls(teacher_cfg.model_id)(teacher_cfg)
         teacher.load_state_dict(teacher_ckpt)
 
-        self.encoder = teacher.encoder
         self.teacher_decoder = teacher.decoder
 
         if hasattr(self.train_cfg, 'encoder_cfg') and hasattr(self.train_cfg, 'encoder_ckpt'):
+            del teacher.encoder
             encoder_cfg = Config.from_yaml(self.train_cfg.encoder_cfg).model
             encoder_ckpt = versatile_load(self.train_cfg.encoder_ckpt)
             encoder = get_model_cls(encoder_cfg.model_id)(encoder_cfg)
@@ -65,9 +65,9 @@ class DistillDecTrainer(BaseTrainer):
                 encoder.load_state_dict(encoder_ckpt)
             except:
                 encoder.encoder.load_state_dict(encoder_ckpt)
-            encoder.encoder.skip_logvar = False
-            encoder.encoder.conv_out_logvar = self.encoder.conv_out_logvar
             self.encoder = encoder.encoder
+        else:
+            self.encoder = teacher.encoder
 
         model_id = self.model_cfg.model_id
         model = get_model_cls(model_id)(self.model_cfg)
@@ -165,13 +165,13 @@ class DistillDecTrainer(BaseTrainer):
 
         self.encoder = self.encoder.to(self.device).bfloat16()
         freeze(self.encoder)
-        self.encoder = torch.compile(self.encoder)#, mode='max-autotune',dynamic=False,fullgraph=True)
+        #self.encoder = torch.compile(self.encoder)
         self.teacher_decoder = self.teacher_decoder.to(self.device).bfloat16().eval()
         freeze(self.teacher_decoder)
 
         self.ema = EMA(
             self.model,
-            beta = 0.9999,
+            beta = 0.995,
             update_after_step = 0,
             update_every = 1
         )
