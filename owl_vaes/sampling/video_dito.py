@@ -169,7 +169,7 @@ def causal_v_sample(
         # Once denoised, add new frame to generated frames
         # And update context to be partially noised
         generated_frames.append(context[:,-chunk_size:].clone())
-        context[:,-chunk_size:] = zlerp(context[:,-chunk_size:], prev_signal)
+        context[:,-chunk_size:] = zlerp(context[:,-chunk_size:], prev_noise, reverse = False)
         ts[:,-chunk_size:] = ts[:,-chunk_size:] * prev_noise
 
     generated_frames = torch.cat(generated_frames, dim = 1).clamp(-1,1)
