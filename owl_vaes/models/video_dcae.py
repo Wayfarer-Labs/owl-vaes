@@ -43,6 +43,12 @@ def unbatch(x, b):
     x = x.reshape(b, -1, c, h, w)
     return x
 
+def latent_ln(z, eps=1e-6):
+    # z: [b, c, h, w]
+    mean = z.mean(dim=(1, 2, 3), keepdim=True)
+    var  = z.var(dim=(1, 2, 3), keepdim=True, unbiased=False)
+    return (z - mean) / torch.sqrt(var + eps)
+
 class Encoder(nn.Module):
     def __init__(self, config : 'ResNetConfig'):
         super().__init__()
@@ -70,12 +76,12 @@ class Encoder(nn.Module):
         blocks_per_stage = config.encoder_blocks_per_stage
         total_blocks = len(blocks_per_stage)
 
-        for block_count in blocks_per_stage:
+        for i, block_count in enumerate(blocks_per_stage):
             next_ch = min(ch*2, ch_max)
 
             blocks.append(DownBlock(ch, next_ch, block_count, total_blocks))
             residuals.append(SpaceToChannel(ch, next_ch))
-            attn_blocks.append(CausalFrameAttn(next_ch, attn_config))
+            attn_blocks.append(CausalFrameAttn(next_ch, attn_config) if i > 1 else nn.Identity())
 
             ch = next_ch
 
@@ -91,21 +97,39 @@ class Encoder(nn.Module):
         # TODO, this is sloppy
         self.down = nn.ModuleList([
             nn.Identity(),
-            TemporalDownsample(min(ch_0 * 4, ch_max)),
-            TemporalDownsample(min(ch_0 * 8, ch_max)),
             nn.Identity(),
+            TemporalDownsample(min(ch_0 * 4, ch_max)),
+            TemporalDownsample(min(ch_0 * 4, ch_max)),
+            #nn.Identity(),
+            #nn.Identity(),
         ])
+        self.normalize_mu = getattr(config, 'normalize_mu', False)
+        self.clamp_mu = getattr(config, 'clamp_mu', False)
+        self.n_frames = getattr(config, 'n_frames', 1)
 
     def forward(self, x, kv_cache = None, attn_mask = None):
         if attn_mask is None:
-            attn_mask = get_frame_causal_attn_mask(
+            # Calculate actual sequence length: frames * tokens_per_frame
+            tokens_per_frame = self.config.tokens_per_frame
+            seq_len = x.shape[1] * tokens_per_frame
+
+            attn_mask_1 = get_frame_causal_attn_mask(
                 self.config,
                 batch_size = x.shape[0],
                 device = x.device,
-                max_q_len = x.shape[1],
-                max_kv_len = x.shape[1],
-                kernel_size = getattr(self.config, "kernel", None)
+                max_q_len = seq_len,
+                max_kv_len = seq_len,
+                kernel_size = getattr(self.config, "encoder_kernel", None)
             )
+            attn_mask_2 = get_frame_causal_attn_mask(
+                self.config,
+                batch_size = x.shape[0],
+                device = x.device,
+                max_q_len = seq_len//2,
+                max_kv_len = seq_len//2,
+                kernel_size = getattr(self.config, "encoder_kernel", None)
+            )
+            # Accounting for temporal downsampling
 
         b = x.shape[0]
         x = batch(x)
@@ -114,11 +138,16 @@ class Encoder(nn.Module):
             res = shortcut(x)
             x = block(x) + res
             x = unbatch(x, b)
-            x = attn(x, kv_cache, attn_mask)
-            x = down(x)
+            if i > 1:
+                x = attn(x, kv_cache, attn_mask_1 if i == 2 else attn_mask_2)
+                x = down(x)
             x = batch(x)
 
         mu = self.conv_out(x)
+        if self.normalize_mu:
+            mu = latent_ln(mu)
+        if self.clamp_mu:
+            mu = torch.clamp(mu, -15.0, 15.0)
         mu = unbatch(mu, b)
 
         if not self.training:
@@ -180,16 +209,21 @@ class Decoder(nn.Module):
             TemporalUpsample(min(ch_0 * 4, ch_max)),
             nn.Identity(),
         ])
+        self.n_frames = getattr(config, 'n_frames', 1)
 
     def forward(self, x, kv_cache = None, attn_mask = None):
         if attn_mask is None:
+            # Calculate actual sequence length: frames * tokens_per_frame
+            tokens_per_frame = self.config.tokens_per_frame
+            seq_len = x.shape[1] * tokens_per_frame
+
             attn_mask = get_frame_causal_attn_mask(
                 self.config,
                 batch_size = x.shape[0],
                 device = x.device,
-                max_q_len = x.shape[1],
-                max_kv_len = x.shape[1],
-                kernel_size = getattr(self.config, "kernel", None)
+                max_q_len = seq_len,
+                max_kv_len = seq_len,
+                kernel_size = getattr(self.config, "decoder_kernel", None)
             )
 
         b = x.shape[0]

@@ -22,7 +22,7 @@ class SpaceToChannel(nn.Module):
 
     def forward(self, x):
         x = self.proj(x.contiguous()) # [c_in, h, w] -> [c_out // 4, h, w]
-        x = F.pixel_unshuffle(x, 2) # [c_out // 4, h, w] -> [c_out, h // 2, w // 2]
+        x = F.pixel_unshuffle(x, 2).contiguous() # [c_out // 4, h, w] -> [c_out, h // 2, w // 2]
         return x
 
 class ChannelToSpace(nn.Module):
@@ -33,7 +33,7 @@ class ChannelToSpace(nn.Module):
 
     def forward(self, x):
         x = self.proj(x.contiguous()) # [c_in, h, w] -> [4 * c_out, h, w]
-        x = F.pixel_shuffle(x, 2) # [4 * c_out, h, w] -> [c_out, 2h, 2w]
+        x = F.pixel_shuffle(x, 2).contiguous() # [4 * c_out, h, w] -> [c_out, 2h, 2w]
         return x
 
 class ChannelAverage(nn.Module):

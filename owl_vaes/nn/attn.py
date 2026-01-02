@@ -7,7 +7,6 @@ import einops as eo
 
 from owl_vaes.configs import TransformerConfig
 
-from .mimetic import mimetic_init
 from .mlp import MLP
 from .normalization import LayerNorm, QKNorm
 from .rope import get_rope_impl
@@ -15,6 +14,7 @@ from ..utils import int_to_tuple
 
 torch.backends.cuda.enable_flash_sdp(enabled=True)
 flex_attention = torch.compile(flex_attention)
+create_block_mask = torch.compile(create_block_mask)
 
 from einops._torch_specific import allow_ops_in_compiled_graph
 allow_ops_in_compiled_graph()
@@ -110,8 +110,8 @@ def get_attn_mask(
     
     return create_block_mask(
         can_attend_to,
-        B=batch_size,
-        H=config.n_heads,
+        B=None,
+        H=None,
         Q_LEN=max_q_len,
         KV_LEN=max_kv_len,
         device=device,
@@ -195,40 +195,6 @@ class StackedTransformer(nn.Module):
 
         return x
 
-# === VIT Specific Layers ===
-
-class PatchProjIn(nn.Module):
-    def __init__(self, d_model, channels = 3, patch_size=1):
-        super().__init__()
-
-        self.proj_in = nn.Conv2d(channels, d_model, patch_size, patch_size, 0, bias=False)
-
-    def forward(self, x):
-        b,c,h,w = x.shape
-        x = self.proj_in(x)
-        x = eo.rearrange(x, 'b c h w -> b (h w) c')
-        return x
-
-class PatchProjOut(nn.Module):
-    def __init__(self, sample_size, d_model, channels = 3, patch_size=1):
-        super().__init__()
-
-        self.norm = LayerNorm(d_model)
-        self.act = nn.SiLU()
-        self.proj = nn.Linear(d_model, channels*patch_size*patch_size)
-        self.sample_size = sample_size
-        self.patch_size = patch_size
-
-        self.n_patches = self.sample_size//self.patch_size
-
-    def forward(self, x):
-        x = self.norm(x)
-        x = self.act(x)
-        x = self.proj(x)
-        x = eo.rearrange(x, 'b (h w) (ph pw c) -> b c (h ph) (w pw)', h = self.n_patches, ph = self.patch_size, pw = self.patch_size)
-
-        return x
-
 def attn_test():
     cfg = TransformerConfig(
         sample_size = 16,
@@ -238,9 +204,7 @@ def attn_test():
         n_layers = 6,
         n_heads = 6,
         d_model = 384,
-        patch_size = 1,
-        causal = False,
-        mimetic_init = False
+        patch_size = 1
     )
 
     # Test Attention layer
@@ -263,20 +227,6 @@ def attn_test():
         x = torch.randn(1, 256, 384).bfloat16().cuda()
         y = stacked(x)
         assert y.shape == (1, 256, 384), f"Expected shape (1,256,384), got {y.shape}"
-
-    # Test PatchProjIn
-    patch_in = PatchProjIn(384, 32, 1).bfloat16().cuda()
-    with torch.no_grad():
-        x = torch.randn(1, 32, 16, 16).bfloat16().cuda()
-        y = patch_in(x)
-        assert y.shape == (1, 256, 384), f"Expected shape (1,256,384), got {y.shape}"
-
-    # Test PatchProjOut
-    patch_out = PatchProjOut(16, 384, 32, 1).bfloat16().cuda()
-    with torch.no_grad():
-        x = torch.randn(1, 256, 384).bfloat16().cuda()
-        y = patch_out(x)
-        assert y.shape == (1, 32, 16, 16), f"Expected shape (1,32,16,16), got {y.shape}"
 
     print("All Tests Passed!")
     

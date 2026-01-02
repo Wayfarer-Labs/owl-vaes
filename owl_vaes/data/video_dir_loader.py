@@ -16,7 +16,7 @@ class RandomRGBFromMP4s:
     - No persistent handles: each yield opens the chosen file once and closes it.
     - Duration/fps are computed lazily on first use and cached in memory.
     """
-    def __init__(self, source, seed=None, target_size=(360,640), window_length=1):
+    def __init__(self, source, seed=None, target_size=(360,640), window_length=1, suppress_warnings = True):
         # Ensure source is a list
         if isinstance(source, str):
             source = [source]
@@ -29,6 +29,7 @@ class RandomRGBFromMP4s:
             raise RuntimeError("No videos found in the supplied source.")
         self.rng = random.Random(seed)
         self.meta = {}  # path -> (duration_s, fps, eps_end_s)
+        self.suppress_warnings = suppress_warnings
 
     @staticmethod
     def _find_mp4s(spec):
@@ -83,7 +84,8 @@ class RandomRGBFromMP4s:
                     return np.stack([self._resize_if_needed(f) for f in frames], axis=0)
 
             except Exception as e:
-                print(f"Error decoding {p}: {e}. Trying another video...")
+                if not self.suppress_warnings:
+                    print(f"Error decoding {p}: {e}. Trying another video...")
                 # Remove failed video from meta cache if it exists
                 if p in self.meta:
                     del self.meta[p]
@@ -214,7 +216,7 @@ class RandomRGBDataset(IterableDataset):
     Assumes frames share a common resolution so default collate can stack.
     If window_length > 1, yields [window_length, C, H, W] tensors.
     """
-    def __init__(self, source, seed: int = 0, target_size = (360, 640), window_length = 1, rank: int = 0, world_size: int = 1):
+    def __init__(self, source, seed: int = 0, target_size = (360, 640), window_length = 1, rank: int = 0, world_size: int = 1, suppress_warnings = True):
         super().__init__()
         self.source = source
         self.seed = int(seed)
@@ -222,6 +224,7 @@ class RandomRGBDataset(IterableDataset):
         self.window_length = window_length
         self.rank = rank
         self.world_size = world_size
+        self.suppress_warnings = suppress_warnings
 
     def __iter__(self):
         info = get_worker_info()
@@ -229,7 +232,7 @@ class RandomRGBDataset(IterableDataset):
         # Derive a per-worker seed (works with persistent workers)
         # Incorporate rank to ensure different data across nodes
         wseed = (torch.initial_seed() + self.seed + wid + self.rank * 10000) % (2**32)
-        rng = RandomRGBFromMP4s(self.source, seed=int(wseed), target_size = self.target_size, window_length = self.window_length)
+        rng = RandomRGBFromMP4s(self.source, seed=int(wseed), target_size = self.target_size, window_length = self.window_length, suppress_warnings = self.suppress_warnings)
         for rgb in rng:
             # HWC uint8 -> CHW uint8 (or THWC -> TCHW for windows)
             # clone() gives the tensor its own resizable storage, preventing rare 'resize_ not allowed' errors.

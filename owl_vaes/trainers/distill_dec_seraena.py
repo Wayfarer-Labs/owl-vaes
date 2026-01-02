@@ -30,10 +30,82 @@ from ..losses.gan import (
     rec_g_loss,
 )
 
-class DistillDecLiveDepthTrainer(BaseTrainer):
+import random
+
+"""
+Seraena GAN training inspired by https://github.com/madebyollin/seraena
+"""
+
+class Buffer:
+    def __init__(self, max_len):
+        self.buff = []
+        self.max_len = max_len
+        self.total_pushes = 0
+
+    @torch.no_grad()
+    def push_and_pull(self, fake, z):
+        # Add new batch to the buffer, but also make it so half of the batch is random
+        for (fake_i, z_i) in zip(fake, z):
+            if len(self.buff) > self.max_len:
+                idx = random.randint(0, len(self.buff) - 1)
+                self.buff[idx][0].copy_(fake_i.detach().clone())
+                self.buff[idx][1].copy_(z_i.detach().clone())
+            else:
+                self.buff.append((fake_i.detach().clone(), z_i.detach().clone()))
+
+        self.total_pushes += 1
+        if self.total_pushes <= 4:
+            return fake, z 
+
+        # Pull half from buffer
+        n_elem = len(fake) // 2
+        inds = random.sample(range(len(self.buff)), n_elem)
+        fake_pull = torch.stack([self.buff[i][0] for i in inds])
+        z_pull = torch.stack([self.buff[i][1] for i in inds])
+
+        return torch.cat([fake[:n_elem], fake_pull], dim=0), torch.cat([z[:n_elem], z_pull], dim=0)
+
+def ser_d_loss(d, real, fake, z, buffer):
+    fake_shuf, z_shuf = buffer.push_and_pull(fake, z)
+    mask = torch.rand(len(fake), device=fake.device) < 0.5
+    mask = mask.view(-1, 1, 1, 1)
+    
+    mask_img = mask.expand_as(fake)
+    mask_z = mask.expand_as(z_shuf)
+
+    x = mask_img * fake_shuf + ~mask_img * real
+    z = mask_z * z_shuf + ~mask_z * z
+    scores = d(x, z)
+    targets = mask.float().mul(2).sub(1).expand_as(scores)
+
+    return F.mse_loss(scores, targets)
+
+def ser_g_loss(d, real, fake, z):
+    # Assumes d is frozen
+    def correction(d, real, fake, z):
+        correction = torch.zeros_like(fake).requires_grad_(True)
+        with torch.no_grad():
+            real_scores = d(real, z)
+        
+        loss = F.mse_loss(d(fake + correction, z), real_scores.detach(), reduction = "none")
+        loss = loss.mean((1,2,3), keepdim=True)
+        loss.sum().backward(inputs=[correction])
+        correction = correction.grad.detach().neg()
+        correction.div_(correction.std(correction=0).add(1.0e-5))
+        return correction
+
+    def make_targets(d, real, fake, z):
+        real, fake, z = real.detach(), fake.detach(), z.detach()
+        c = correction(d, real, fake, z)
+        return fake + c
+
+    targets = make_targets(d, real, fake, z)
+    return F.mse_loss(fake, targets.detach())
+
+class SerDistillDecTrainer(BaseTrainer):
     """
     Trainer for distilling the decoder, with frozen encoder.
-    Does L1 + DWL + LPIPS + GAN
+    Does L2 + LPIPS + GAN + Feature Matching + R1/R2 regularization
 
     :param train_cfg: Configuration for training
     :param logging_cfg: Configuration for logging
@@ -54,10 +126,10 @@ class DistillDecLiveDepthTrainer(BaseTrainer):
         teacher = get_model_cls(teacher_cfg.model_id)(teacher_cfg)
         teacher.load_state_dict(teacher_ckpt)
 
-        self.encoder = teacher.encoder
         self.teacher_decoder = teacher.decoder
 
         if hasattr(self.train_cfg, 'encoder_cfg') and hasattr(self.train_cfg, 'encoder_ckpt'):
+            del teacher.encoder
             encoder_cfg = Config.from_yaml(self.train_cfg.encoder_cfg).model
             encoder_ckpt = versatile_load(self.train_cfg.encoder_ckpt)
             encoder = get_model_cls(encoder_cfg.model_id)(encoder_cfg)
@@ -65,11 +137,9 @@ class DistillDecLiveDepthTrainer(BaseTrainer):
                 encoder.load_state_dict(encoder_ckpt)
             except:
                 encoder.encoder.load_state_dict(encoder_ckpt)
-            
-            if encoder.encoder.skip_logvar:
-                encoder.encoder.skip_logvar = False
-                encoder.encoder.conv_out_logvar = self.encoder.conv_out_logvar
             self.encoder = encoder.encoder
+        else:
+            self.encoder = teacher.encoder
 
         model_id = self.model_cfg.model_id
         model = get_model_cls(model_id)(self.model_cfg)
@@ -104,15 +174,6 @@ class DistillDecLiveDepthTrainer(BaseTrainer):
         self.scaler = None
 
         self.total_step_counter = 0
-
-        import sys
-        sys.path.append("./FlashDepth")
-        from flashdepth import FlashDepthModel
-        self.depth = FlashDepthModel(
-            model_size='vits',
-            use_mamba=False,
-            checkpoint_path='FlashDepth/configs/flashdepth/iter_43002.pth'
-        )
 
     def save(self):
         save_dict = {
@@ -152,6 +213,7 @@ class DistillDecLiveDepthTrainer(BaseTrainer):
         # Loss weights
         lpips_weight = self.train_cfg.loss_weights.get('lpips', 0.0)
         gan_weight = self.train_cfg.loss_weights.get('gan', 0.1)
+        r12_weight = self.train_cfg.loss_weights.get('r12', 0.0)
         dwt_weight = self.train_cfg.loss_weights.get('dwt', 0.0)
         l1_weight = self.train_cfg.loss_weights.get('l1', 0.0)
         l2_weight = self.train_cfg.loss_weights.get('l2', 0.0)
@@ -175,16 +237,13 @@ class DistillDecLiveDepthTrainer(BaseTrainer):
 
         self.encoder = self.encoder.to(self.device).bfloat16()
         freeze(self.encoder)
-        self.encoder = torch.compile(self.encoder)#, mode='max-autotune',dynamic=False,fullgraph=True)
-        self.teacher_decoder = self.teacher_decoder.to(self.device).bfloat16()
-
-        # Depth prep
-        self.depth = self.depth.to(self.device).bfloat16()
-        self.depth = torch.compile(self.depth)
+        #self.encoder = torch.compile(self.encoder)
+        self.teacher_decoder = self.teacher_decoder.to(self.device).bfloat16().eval()
+        freeze(self.teacher_decoder)
 
         self.ema = EMA(
             self.model,
-            beta = 0.9999,
+            beta = 0.995,
             update_after_step = 0,
             update_every = 1
         )
@@ -218,9 +277,13 @@ class DistillDecLiveDepthTrainer(BaseTrainer):
         # Dataset setup
         loader = get_loader(self.train_cfg.data_id, self.train_cfg.batch_size, **self.train_cfg.data_kwargs)
 
+        buffer = Buffer(8192)
+
         def warmup_weight():
             if self.total_step_counter < self.train_cfg.delay_adv:
                 return 0.0
+            elif self.train_cfg.warmup_adv == 0:
+                return 1.0
             else:
                 x = (self.total_step_counter - self.train_cfg.delay_adv) / self.train_cfg.warmup_adv
                 x = max(0.0, min(1.0, x))
@@ -230,11 +293,7 @@ class DistillDecLiveDepthTrainer(BaseTrainer):
 
         def warmup_gan_weight(): return warmup_weight() * gan_weight
         
-        @torch.no_grad()
         def teacher_sample(batch):
-            batch = F.interpolate(batch, (360, 640), mode='bilinear', align_corners=False)
-            batch_depth = self.depth(batch).unsqueeze(1)
-            batch = torch.cat([batch, batch_depth], dim = 1)
             mu, logvar = self.encoder(batch)
             teacher_std = (logvar/2).exp()
             teacher_z = torch.randn_like(mu) * teacher_std + mu
@@ -247,6 +306,11 @@ class DistillDecLiveDepthTrainer(BaseTrainer):
                 total_loss = 0.
                 batch = batch.to(self.device).bfloat16()
 
+                unequal_size = (self.model_input_size != batch.shape[-2:])
+                if unequal_size:
+                    full_batch = batch.clone()
+                    batch = F.interpolate(batch, self.model_input_size, mode='bilinear', align_corners=False)
+
                 with ctx:
                     with torch.no_grad():
                         teacher_z = teacher_sample(batch)
@@ -257,8 +321,9 @@ class DistillDecLiveDepthTrainer(BaseTrainer):
                     # Discriminator training - RGB only
                     if self.discriminator is not None and self.total_step_counter >= self.train_cfg.delay_adv:
                         unfreeze(self.discriminator)
-                        disc_loss = d_loss(self.discriminator, batch_rec[:,:3].detach(), batch[:,:3].detach()) / accum_steps
+                        disc_loss = ser_d_loss(self.discriminator, batch_rec.detach(), batch.detach(), teacher_z.detach(), buffer) / accum_steps
                         metrics.log('disc_loss', disc_loss)
+
                         self.scaler.scale(disc_loss).backward()
                         freeze(self.discriminator)
 
@@ -269,27 +334,25 @@ class DistillDecLiveDepthTrainer(BaseTrainer):
 
                     if lpips_weight > 0.0:
                         with ctx:
-                            lpips_loss = lpips(batch_rec[:,:3], batch[:,:3]) / accum_steps
+                            lpips_loss = lpips(batch_rec, batch) / accum_steps
                         total_loss += lpips_loss * lpips_weight
                         metrics.log('lpips_loss', lpips_loss)
                     
                     if dwt_weight > 0.0:
                         with ctx:
-                            dwt_loss = dwt_loss_fn(batch_rec[:,:3], batch[:,:3]) / accum_steps
+                            dwt_loss = dwt_loss_fn(batch_rec, batch) / accum_steps
                         total_loss += dwt_loss * dwt_weight
                         metrics.log('dwt_loss', dwt_loss)
                     
                     if self.discriminator is not None:
+                        self.discriminator.eval()
                         crnt_gan_weight = warmup_gan_weight()
                         if crnt_gan_weight > 0.0:
-                            with ctx:
-                                if self.use_rec_disc:
-                                    gan_loss = rec_g_loss(self.discriminator, batch_rec[:,:3], batch[:,:3])
-                                else:
-                                    gan_loss = g_loss(self.discriminator, batch_rec[:,:3])
-                                gan_loss = gan_loss / accum_steps
+                            gan_loss = ser_g_loss(self.discriminator, batch, batch_rec, teacher_z.detach())
+                            gan_loss = gan_loss / accum_steps
                             metrics.log('gan_loss', gan_loss)
                             total_loss += crnt_gan_weight * gan_loss
+                        self.discriminator.train()
 
                     self.scaler.scale(total_loss).backward()
 
@@ -325,14 +388,26 @@ class DistillDecLiveDepthTrainer(BaseTrainer):
 
                         if self.total_step_counter % self.train_cfg.sample_interval == 0:
                             with ctx:
+                                if unequal_size:
+                                    teacher_z = teacher_sample(full_batch)
                                 ema_rec = self.ema.ema_model(teacher_z)
-                            teacher_rec = self.teacher_decoder(teacher_z.bfloat16())[:,:3]
+                                teacher_rec = self.teacher_decoder(teacher_z)[:,:3]
 
                             wandb_dict['samples'] = to_wandb(
                                 teacher_rec.detach().contiguous().bfloat16(),
                                 ema_rec.detach().contiguous().bfloat16(),
                                 gather = False
                             )
+
+                            # Log depth maps if present (4 or 7 channels)
+                            if batch.shape[1] >= 4:
+                                depth_samples = to_wandb_grayscale(
+                                    teacher_rec[:,3:4].detach().contiguous().bfloat16(),
+                                    ema_rec[:,3:4].detach().contiguous().bfloat16(),
+                                    gather = False
+                                )
+                                if depth_samples:
+                                    wandb_dict['depth_samples'] = depth_samples
 
                         if self.rank == 0:
                             wandb.log(wandb_dict)

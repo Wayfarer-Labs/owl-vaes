@@ -21,3 +21,6 @@ def get_discriminator_cls(model_id):
     if model_id == "patchgan3d":
         from .patchgan3d import PatchGAN3D
         return PatchGAN3D
+    if model_id == "seraena":
+        from .seraena import SeraenaDiscriminator
+        return SeraenaDiscriminator

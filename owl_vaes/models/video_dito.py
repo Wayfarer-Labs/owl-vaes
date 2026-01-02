@@ -1,21 +1,23 @@
 import torch
-import torch.nn.functional as F
 from torch import nn
+import torch.nn.functional as F
 
 from copy import deepcopy
 import einops as eo
 
-from .dcae import Encoder
-from ..nn.dit import DiT, FinalLayer
+from .video_dcae import Encoder
+from ..utils import video_interpolate
+
+from ..nn.video_ae import get_frame_causal_attn_mask
 from ..nn.embeddings import TimestepEmbedding
-from ..nn.attn import get_attn_mask
+from ..nn.dit import DiT, FinalLayer
 from ..utils import int_to_tuple
 
-class DiTODecoder(nn.Module):
+class VideoDiTODecoder(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        config.rope_impl = 'image'
+        config.rope_impl = 'video'
         size = config.sample_size
         patch_size = config.patch_size
         if isinstance(patch_size, int):
@@ -34,17 +36,21 @@ class DiTODecoder(nn.Module):
         self.p_y, self.p_x = patch_size
         self.n_p_y = config.sample_size[0] // self.p_y
         self.n_p_x = config.sample_size[1] // self.p_x
+        self.n_frames = config.n_frames
+        self.temporal_factor = getattr(config, "temporal_factor", 4)
 
     def forward(self, x, z, ts, attn_mask = None):
-        # x is [b,c,h,w]
-        # ts is [b,] in [0,1]
+        # x is [b,n,c,h,w]
+        # z is [b,n//f,c,h,w]
+        # ts is [b,n] in [0,1]
+        b = x.shape[0]
     
         if attn_mask is None:
             # z is interpolated and concatenated channel-wise, so no extra tokens
-            max_q = self.n_p_y * self.n_p_x
+            max_q = self.n_p_y * self.n_p_x * x.shape[1]
             max_kv = max_q
 
-            attn_mask = get_attn_mask(
+            attn_mask = get_frame_causal_attn_mask(
                 self.config,
                 batch_size = x.shape[0],
                 device = x.device,
@@ -53,16 +59,20 @@ class DiTODecoder(nn.Module):
                 kernel_size = int_to_tuple(getattr(self.config, "kernel", None))
             )
 
-        cond = self.ts_embed(ts)
+        ts_flat = eo.rearrange(ts, 'b n -> (b n)')
+        cond = self.ts_embed(ts_flat)
+        cond = eo.rearrange(cond, '(b n) d -> b n d', b = b)
 
-        # Convert from image format [b,c,h,w] to patches [b,n_patches,patch_size*patch_size*c]
-        z = F.interpolate(z, size=x.shape[-2:], mode='bilinear', align_corners=False)
-        orig_c = x.shape[1]
-        x = torch.cat([x, z], dim=1)
+        # z needs to be made same shape as x for concat
+        z = video_interpolate(z, size=x.shape[-2:], mode='bilinear', align_corners=False) # first spatially
+        z = eo.repeat(z, 'b n c h w -> b (n f) c h w', f = self.temporal_factor) # then temporally
+
+        orig_c = x.shape[2]
+        x = torch.cat([x, z], dim=2)
 
         x = eo.rearrange(
             x,
-            'b c (n_p_h p_h) (n_p_w p_w) -> b (n_p_h n_p_w) (p_h p_w c)',
+            'b t c (n_p_h p_h) (n_p_w p_w) -> b (t n_p_h n_p_w) (p_h p_w c)',
             p_h = self.p_y,
             p_w = self.p_x
         )
@@ -74,26 +84,30 @@ class DiTODecoder(nn.Module):
 
         x = eo.rearrange(
             x,
-            'b (n_p_h n_p_w) (p_h p_w c) -> b c (n_p_h p_h) (n_p_w p_w)',
+            'b (t n_p_h n_p_w) (p_h p_w c) -> b t c (n_p_h p_h) (n_p_w p_w)',
             n_p_h = self.n_p_y,
             n_p_w = self.n_p_x,
             p_h = self.p_y,
             p_w = self.p_x
         )
 
-        return x[:,:orig_c]
+        return x[:,:,:orig_c]
 
-class DiTo(nn.Module):
+class VideoDiTo(nn.Module):
     """
-    Diffusion Tokenizer with CFG and X0 Prediction
+    Diffusion Tokenizer for video!
     """
     def __init__(self, config):
         super().__init__()
 
-        config.skip_logvar = True
-        config.normalize_mu = True
-        config.clamp_mu = False
-        self.encoder = Encoder(config)
+        encoder_config = deepcopy(config)
+        encoder_config.skip_logvar = True
+        encoder_config.normalize_mu = True
+        encoder_config.clamp_mu = False
+        encoder_config.d_model = 768
+        encoder_config.n_heads = 12
+        encoder_config.encoder_kernel = getattr(config, 'encoder_kernel', None)
+        self.encoder = Encoder(encoder_config)
 
         proxy_channels = getattr(config, "proxy_channels", config.channels)
         proxy_sample_size = getattr(config, "proxy_sample_size", config.sample_size)
@@ -101,19 +115,27 @@ class DiTo(nn.Module):
         decoder_config = deepcopy(config)
         decoder_config.channels = proxy_channels + config.latent_channels
         decoder_config.sample_size = proxy_sample_size
+        decoder_config.tokens_per_frame = (
+            decoder_config.sample_size[0] // decoder_config.patch_size[0] *
+            decoder_config.sample_size[1] // decoder_config.patch_size[1]
+        )
+        decoder_config.kernel = getattr(config, 'decoder_kernel', None)
 
-        self.decoder = DiTODecoder(decoder_config)
+        self.decoder = VideoDiTODecoder(decoder_config)
 
         self.x0_mode = getattr(config, "x0_mode", True)
         self.noise_scale = getattr(config, "noise_scale", 1.0)
+        self.temporal_factor = getattr(config, "temporal_factor", 4)
+        self.cfm_weight = getattr(config, "cfm_weight", 0.05)
 
     @torch.no_grad()
-    def sample_timesteps(self, b, device, dtype):
+    def sample_timesteps(self, b, n, device, dtype):
         # Sample ts in [0, 1] from a U(0,1)
-        ts = torch.rand(b, device=device, dtype=dtype)
+        ts = torch.rand(b, n, device=device, dtype=dtype)
         return ts
 
     def forward(self, x, proxy = None):
+        # x is [b,n,c,h,w]
         z = self.encoder(x)
         z_original = z.clone()
 
@@ -122,9 +144,9 @@ class DiTo(nn.Module):
 
         # Noise sync and then timesteps
         with torch.no_grad():
-            sync_mask = torch.rand(len(z), device=z.device) < 0.1
+            sync_mask = torch.rand(z.shape[0], z.shape[1], device=z.device) < 0.1
 
-            tau = self.sample_timesteps(len(z), z.device, z.dtype)
+            tau = self.sample_timesteps(z.shape[0], z.shape[1], z.device, z.dtype)
             tau_signal = torch.ones_like(tau)
 
             tau = torch.where(
@@ -133,20 +155,22 @@ class DiTo(nn.Module):
                 tau_signal
             )
             eps_z = torch.randn_like(z)
-            tau_exp = tau.view(-1, 1, 1, 1).expand_as(z)
-
-            ts = self.sample_timesteps(len(x), x.device, x.dtype)
+            tau_exp = tau.view(tau.shape[0], tau.shape[1], 1, 1, 1).expand_as(z)
+            
+            ts = self.sample_timesteps(x.shape[0], x.shape[1], x.device, x.dtype)
+            sync_mask_rep = eo.repeat(sync_mask, 'b n -> b (n f)', f = self.temporal_factor)
+            tau_rep = eo.repeat(tau, 'b n -> b (n f)', f = self.temporal_factor)
 
             # Sync mask => x should be just as noisy as z
             # In x0 mode, x(0) is noise, x(1) is image
             # In flow mode, x(0) is image, x(1) is noise
             ts = torch.where(
-                sync_mask,
+                sync_mask_rep,
                 ts,
-                ts * tau if self.x0_mode else (1 - ts * tau)
+                ts * tau_rep if self.x0_mode else (1 - ts * tau_rep)
             )
             eps_x = torch.randn_like(x)
-            ts_exp = ts.view(-1, 1, 1, 1).expand_as(x)
+            ts_exp = ts.view(ts.shape[0], ts.shape[1], 1, 1, 1).expand_as(x)
 
             if self.x0_mode:
                 noisy_x = ts_exp * x + (1. - ts_exp) * eps_x
@@ -164,5 +188,9 @@ class DiTo(nn.Module):
             noisy_z = z * (1. - tau_exp) + tau_exp * eps_z
             pred = self.decoder(noisy_x, noisy_z, ts)
         loss = F.mse_loss(pred, target)
+        #if self.cfm_weight > 0:
+        #    shuffled_target = torch.cat([target[1:], target[:1]], dim = 0) # Shift target by 1 on batch dim
+        #    cfm_loss = -1 * F.mse_loss(pred, shuffled_target)
+        #    loss = loss + self.cfm_weight * cfm_loss
 
         return loss, z_original

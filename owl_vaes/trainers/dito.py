@@ -137,6 +137,14 @@ class DiToTrainer(BaseTrainer):
                 total_loss += diff_loss
                 self.scaler.scale(total_loss).backward()
 
+                with torch.no_grad():
+                    metrics.log_dict({
+                        'z_std' : z.detach().std() ,
+                        'z_shift' : z.detach().mean(),
+                        'z_max' : z.detach().max(),
+                        'z_min' : z.detach().min()
+                    })
+
                 # Updates
                 if self.train_cfg.opt.lower() != "muon":
                     self.scaler.unscale_(self.opt)

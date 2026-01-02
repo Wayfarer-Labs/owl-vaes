@@ -48,27 +48,15 @@ class VideoAdaLN(nn.Module):
         p_y, p_x = int_to_tuple(config.patch_size)
         self.n_p_y = h // p_y
         self.n_p_x = w // p_x
-
-        self.n_latent = config.latent_size
     
-    def broadcast_to_video_and_latent(self, x):
+    def broadcast_to_video(self, x):
         # x is [b,n_frames,d]
-        x_1 = eo.repeat(
+        return eo.repeat(
             x,
             'b n_frames d -> b (n_frames h w) d',
             h = self.n_p_y,
             w = self.n_p_x
         )
-        if self.n_latent == 0:
-            return x_1
-        x_2 = eo.repeat(
-            x,
-            'b n_frames d -> b (n_frames h w) d',
-            h = self.n_latent,
-            w = self.n_latent
-        )
-        x = torch.cat([x_1, x_2], dim = 1).contiguous()
-        return x
 
     def forward(self, x, cond):
         # x is [b,n,d]
@@ -77,8 +65,8 @@ class VideoAdaLN(nn.Module):
         ab = self.fc(y) # [b,n_frames,2d]
         a,b = ab.chunk(2,dim=-1) # each [b,n_frames,d]
 
-        a = self.broadcast_to_video_and_latent(a)
-        b = self.broadcast_to_video_and_latent(b)
+        a = self.broadcast_to_video(a)
+        b = self.broadcast_to_video(b)
 
         x = self.norm(x) * (1. + a) + b
         return x
@@ -121,31 +109,22 @@ class VideoGate(nn.Module):
         p_y, p_x = int_to_tuple(config.patch_size)
         self.n_p_y = h // p_y
         self.n_p_x = w // p_x
-        self.n_latent = config.latent_size
 
-    def broadcast_to_video_and_latent(self, x):
+    def broadcast_to_video(self, x):
         # x is [b,n_frames,d]
-        x_1 = eo.repeat(
+        return eo.repeat(
             x,
             'b n_frames d -> b (n_frames h w) d',
             h = self.n_p_y,
             w = self.n_p_x
         )
-        x_2 = eo.repeat(
-            x,
-            'b n_frames d -> b (n_frames h w) d',
-            h = self.n_latent,
-            w = self.n_latent
-        )
-        x = torch.cat([x_1, x_2], dim = 1).contiguous()
-        return x
     
     def forward(self, x, cond):
         # x is [b,n,d]
         # cond is [b,n_frames]
         y = F.silu(cond)
         c = self.fc_c(y) # [b,n_frames,d]
-        c = self.broadcast_to_video_and_latent(c)
+        c = self.broadcast_to_video(c)
         return c * x
 
 def Gate(config):

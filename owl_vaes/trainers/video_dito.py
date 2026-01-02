@@ -17,15 +17,15 @@ from ..discriminators import get_discriminator_cls
 from ..muon import init_muon
 from ..nn.lpips import get_lpips_cls
 from ..schedulers import get_scheduler_cls
-from ..utils import Timer, freeze, unfreeze, versatile_load
-from ..utils.logging import LogHelper, to_wandb, to_wandb_grayscale
+from ..utils import Timer, freeze, unfreeze, versatile_load, video_interpolate
+from ..utils.logging import LogHelper, to_wandb_video_sidebyside
 from .base import BaseTrainer
 from ..configs import Config
-from ..sampling import flow_sample, x0_sample
+from ..sampling.video_dito import causal_x0_sample, causal_v_sample
 
-class DiffDecLiveDepthTrainer(BaseTrainer):
+class VideoDiToTrainer(BaseTrainer):
     """
-    Trainer for diffusion decoder with proxy VAE + depth encoder
+    Trainer for diffusion tokenizer
 
     :param train_cfg: Configuration for training
     :param logging_cfg: Configuration for logging
@@ -37,20 +37,9 @@ class DiffDecLiveDepthTrainer(BaseTrainer):
     def __init__(self,*args,**kwargs):
         super().__init__(*args,**kwargs)
 
-        teacher_ckpt_path = self.train_cfg.teacher_ckpt
-        teacher_cfg_path = self.train_cfg.teacher_cfg
-
-        teacher_ckpt = versatile_load(teacher_ckpt_path)
-        teacher_cfg = Config.from_yaml(teacher_cfg_path).model
-
-        teacher = get_model_cls(teacher_cfg.model_id)(teacher_cfg)
-        teacher.load_state_dict(teacher_ckpt)
-
-        self.encoder = teacher.encoder
-        del teacher.decoder
-
         model_id = self.model_cfg.model_id
         self.model = get_model_cls(model_id)(self.model_cfg)
+        self.model_input_size = [int(self.model_cfg.sample_size[0]), int(self.model_cfg.sample_size[1])]
 
         if self.rank == 0:
             model_params = sum(p.numel() for p in self.model.parameters())
@@ -64,22 +53,12 @@ class DiffDecLiveDepthTrainer(BaseTrainer):
 
         self.total_step_counter = 0
 
-        # Depth 
-        import sys
-        sys.path.append("./FlashDepth")
-        from flashdepth import FlashDepthModel
-        self.depth = FlashDepthModel(
-            model_size='vits',
-            use_mamba=False,
-            checkpoint_path='FlashDepth/configs/flashdepth/iter_43002.pth'
-        )
-
-        # TAEF1
-        from diffusers import AutoencoderTiny
-        proxy_id = getattr(self.train_cfg, 'proxy_id', 'madebyollin/taef1')
-        self.no_proxy = (proxy_id is None) or (proxy_id == 'null') or (proxy_id == 'None')
-        if not self.no_proxy:
-            self.proxy = AutoencoderTiny.from_pretrained(proxy_id)
+        self.use_proxy = getattr(self.train_cfg, "use_proxy", False)
+        if self.use_proxy:
+            from diffusers import AutoModel
+            self.proxy = AutoModel.from_pretrained("madebyollin/taef1")
+            self.proxy = self.proxy.to(self.device).bfloat16()
+            self.proxy.encoder = torch.compile(self.proxy.encoder)
 
     def save(self):
         save_dict = {
@@ -89,23 +68,28 @@ class DiffDecLiveDepthTrainer(BaseTrainer):
             'scaler' : self.scaler.state_dict(),
             'steps': self.total_step_counter
         }
+        if self.scheduler is not None:
+            save_dict['scheduler'] = self.scheduler.state_dict()
         super().save(save_dict)
 
     def load(self):
         if not hasattr(self.train_cfg, 'resume_ckpt') or self.train_cfg.resume_ckpt is None:
             return
-        
+
         save_dict = super().load(self.train_cfg.resume_ckpt)
         self.model.load_state_dict(save_dict['model'])
         self.ema.load_state_dict(save_dict['ema'])
         self.opt.load_state_dict(save_dict['opt'])
         self.scaler.load_state_dict(save_dict['scaler'])
         self.total_step_counter = save_dict['steps']
+
+        if self.scheduler is not None and 'scheduler' in save_dict:
+            self.scheduler.load_state_dict(save_dict['scheduler'])
     
     def get_ema_core(self):
         if self.world_size > 1:
-            return self.ema.ema_model.module.core
-        return self.ema.ema_model.core
+            return self.ema.ema_model.module.decoder
+        return self.ema.ema_model.decoder
 
     def train(self):
         torch.cuda.set_device(self.local_rank)
@@ -113,27 +97,16 @@ class DiffDecLiveDepthTrainer(BaseTrainer):
         # Prepare model, lpips, ema
         self.model = self.model.to(self.device).train()
         if self.world_size > 1:
-            self.model = DDP(self.model, find_unused_parameters=True)
-        
-        self.encoder = self.encoder.to(self.device).bfloat16()
-        freeze(self.encoder)
-        self.encoder = torch.compile(self.encoder)#, mode='max-autotune',dynamic=False,fullgraph=True)
-
-        # Depth prep
-        freeze(self.depth)
-        self.depth = self.depth.to(self.device).bfloat16()
-        self.depth = torch.compile(self.depth)
-
-        # TAEF1 prep
-        if not self.no_proxy:
-            freeze(self.proxy)
-            self.proxy = self.proxy.to(self.device).bfloat16()
-            self.proxy.encoder = torch.compile(self.proxy.encoder)
-            self.proxy.decoder = torch.compile(self.proxy.decoder)
+            self.model = DDP(
+                self.model,
+                find_unused_parameters=False,  # Critical for multi-node performance
+                gradient_as_bucket_view=True,   # Reduces memory copies
+                static_graph=True                # Graph structure doesn't change
+            )
 
         self.ema = EMA(
             self.model,
-            beta = 0.9999,
+            beta = 0.995,
             update_after_step = 0,
             update_every = 1
         )
@@ -147,6 +120,13 @@ class DiffDecLiveDepthTrainer(BaseTrainer):
             opt_cls = getattr(torch.optim, self.train_cfg.opt)
             self.opt = opt_cls(self.model.parameters(), **self.train_cfg.opt_kwargs)
 
+        # Set up scheduler if specified
+        if hasattr(self.train_cfg, 'scheduler') and self.train_cfg.scheduler is not None:
+            scheduler_cls = get_scheduler_cls(self.train_cfg.scheduler)
+            self.scheduler = scheduler_cls(self.opt, **self.train_cfg.scheduler_kwargs)
+        else:
+            self.scheduler = None
+
         self.scaler = torch.amp.GradScaler()
         ctx = torch.amp.autocast(self.device, torch.bfloat16)
 
@@ -156,47 +136,31 @@ class DiffDecLiveDepthTrainer(BaseTrainer):
         timer = Timer()
         timer.reset()
         metrics = LogHelper()
-        if self.rank == 0:
-            wandb.watch(self.get_module(), log = 'all')
 
         # Dataset setup
-        loader = get_loader(self.train_cfg.data_id, self.train_cfg.batch_size, **self.train_cfg.data_kwargs)
-
-        @torch.no_grad()
-        def teacher_sample(batch):
-            batch = F.interpolate(batch, (360, 640), mode='bilinear', align_corners=False)
-            batch_depth = self.depth(batch).unsqueeze(1)
-            batch = torch.cat([batch, batch_depth], dim = 1)
-            mu, logvar = self.encoder(batch)
-            teacher_std = (logvar/2).exp()
-            teacher_z = torch.randn_like(mu) * teacher_std + mu
-            teacher_z = teacher_z / self.train_cfg.latent_scale
-            return teacher_z
-        
-        @torch.no_grad()
-        def proxy_encode(batch):
-            if self.no_proxy:
-                return batch
-            proxy_z = self.proxy.encoder(batch[:,:3])
-            proxy_z = proxy_z / self.train_cfg.ldm_scale # [b,16,45,80]
-            return proxy_z
+        loader = get_loader(self.train_cfg.data_id, self.train_cfg.batch_size, rank=self.rank, world_size=self.world_size, **self.train_cfg.data_kwargs)
 
         for _ in range(self.train_cfg.epochs):
             for batch in loader:
                 total_loss = 0.
                 batch = batch.to(self.device).bfloat16()
+                batch = video_interpolate(batch, self.model_input_size, mode='bilinear', align_corners=False)
+                proxy_batch = self.proxy.encoder(batch) if self.use_proxy else None
 
                 with ctx:
-                    with torch.no_grad():
-                        teacher_z = teacher_sample(batch)
-                        proxy_z = proxy_encode(batch)
-                        
-                    diff_loss = self.model(proxy_z, teacher_z)
-                    diff_loss = diff_loss
+                    diff_loss, z = self.model(batch, proxy = proxy_batch)
 
                 metrics.log('diff_loss', diff_loss)
                 total_loss += diff_loss
                 self.scaler.scale(total_loss).backward()
+
+                with torch.no_grad():
+                    metrics.log_dict({
+                        'z_std' : z.detach().std() ,
+                        'z_shift' : z.detach().mean(),
+                        'z_max' : z.detach().max(),
+                        'z_min' : z.detach().min()
+                    })
 
                 # Updates
                 if self.train_cfg.opt.lower() != "muon":
@@ -205,9 +169,13 @@ class DiffDecLiveDepthTrainer(BaseTrainer):
 
                 self.scaler.step(self.opt)
                 self.opt.zero_grad(set_to_none=True)
-                
+
                 self.scaler.update()
                 self.ema.update()
+
+                # Step scheduler if it exists
+                if self.scheduler is not None:
+                    self.scheduler.step()
 
                 # Do logging stuff with sampling stuff in the middle
                 with torch.no_grad():
@@ -215,24 +183,24 @@ class DiffDecLiveDepthTrainer(BaseTrainer):
                     wandb_dict['time'] = timer.hit()
                     timer.reset()
 
+                    # Log learning rates
+                    if self.scheduler is not None:
+                        for idx, param_group in enumerate(self.opt.param_groups):
+                            wandb_dict[f'lr/group_{idx}'] = param_group['lr']
+
                     if self.total_step_counter % self.train_cfg.sample_interval == 0:
                         with ctx:
-                            cfg_scale = getattr(self.train_cfg, 'cfg_scale', 1.0)
-                            sample_fn = flow_sample if not self.model_cfg.x0_mode else x0_sample
+                            sample_fn = causal_x0_sample if self.model_cfg.x0_mode else causal_v_sample
                             ema_rec = sample_fn(
                                 self.get_ema_core(),
-                                proxy_z,
-                                teacher_z,
-                                self.train_cfg.sampling_steps,
-                                self.proxy.decoder if not self.no_proxy else None,
-                                scaling_factor = self.train_cfg.ldm_scale,
-                                cfg_scale = cfg_scale
+                                batch.detach(),
+                                z.detach(),
+                                self.train_cfg.sampling_steps
                             )
 
-                        wandb_dict['samples'] = to_wandb(
+                        wandb_dict['samples'] = to_wandb_video_sidebyside(
                             batch.detach().contiguous().bfloat16(),
-                            ema_rec.detach().contiguous().bfloat16(),
-                            gather = False
+                            ema_rec.detach().contiguous().bfloat16()
                         )
 
                     if self.rank == 0:
@@ -242,6 +210,3 @@ class DiffDecLiveDepthTrainer(BaseTrainer):
                 if self.total_step_counter % self.train_cfg.save_interval == 0:
                     if self.rank == 0:
                         self.save()
-
-                self.barrier()
-
