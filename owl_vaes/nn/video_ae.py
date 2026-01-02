@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.attention.flex_attention import create_block_mask
 
 import math
 import einops as eo
@@ -9,7 +8,7 @@ from copy import deepcopy
 
 from .resnet import WeightNormConv2d
 from .normalization import LayerNorm
-from .attn import Attn
+from .attn import Attn, create_block_mask
 from ..utils import int_to_tuple
 
 """
@@ -140,11 +139,12 @@ def get_frame_causal_attn_mask(
 
     return create_block_mask(
         can_attend_to,
-        B=batch_size,
-        H=config.n_heads,
+        B=None,
+        H=None,
         Q_LEN=max_q_len,
         KV_LEN=max_kv_len,
         device=device,
+        _compile=True
     )
 
 

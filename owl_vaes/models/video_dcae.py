@@ -111,9 +111,9 @@ class Encoder(nn.Module):
         if attn_mask is None:
             # Calculate actual sequence length: frames * tokens_per_frame
             tokens_per_frame = self.config.tokens_per_frame
-            seq_len = self.n_frames * tokens_per_frame
+            seq_len = x.shape[1] * tokens_per_frame
 
-            attn_mask = get_frame_causal_attn_mask(
+            attn_mask_1 = get_frame_causal_attn_mask(
                 self.config,
                 batch_size = x.shape[0],
                 device = x.device,
@@ -121,6 +121,15 @@ class Encoder(nn.Module):
                 max_kv_len = seq_len,
                 kernel_size = getattr(self.config, "encoder_kernel", None)
             )
+            attn_mask_2 = get_frame_causal_attn_mask(
+                self.config,
+                batch_size = x.shape[0],
+                device = x.device,
+                max_q_len = seq_len//2,
+                max_kv_len = seq_len//2,
+                kernel_size = getattr(self.config, "encoder_kernel", None)
+            )
+            # Accounting for temporal downsampling
 
         b = x.shape[0]
         x = batch(x)
@@ -130,7 +139,7 @@ class Encoder(nn.Module):
             x = block(x) + res
             x = unbatch(x, b)
             if i > 1:
-                x = attn(x, kv_cache, attn_mask)
+                x = attn(x, kv_cache, attn_mask_1 if i == 2 else attn_mask_2)
                 x = down(x)
             x = batch(x)
 
@@ -206,7 +215,7 @@ class Decoder(nn.Module):
         if attn_mask is None:
             # Calculate actual sequence length: frames * tokens_per_frame
             tokens_per_frame = self.config.tokens_per_frame
-            seq_len = self.n_frames * tokens_per_frame
+            seq_len = x.shape[1] * tokens_per_frame
 
             attn_mask = get_frame_causal_attn_mask(
                 self.config,

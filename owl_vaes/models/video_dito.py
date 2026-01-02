@@ -47,7 +47,7 @@ class VideoDiTODecoder(nn.Module):
     
         if attn_mask is None:
             # z is interpolated and concatenated channel-wise, so no extra tokens
-            max_q = self.n_p_y * self.n_p_x * self.n_frames
+            max_q = self.n_p_y * self.n_p_x * x.shape[1]
             max_kv = max_q
 
             attn_mask = get_frame_causal_attn_mask(
@@ -103,7 +103,7 @@ class VideoDiTo(nn.Module):
         encoder_config = deepcopy(config)
         encoder_config.skip_logvar = True
         encoder_config.normalize_mu = True
-        encoder_config.clamp_mu = True
+        encoder_config.clamp_mu = False
         encoder_config.d_model = 768
         encoder_config.n_heads = 12
         encoder_config.encoder_kernel = getattr(config, 'encoder_kernel', None)
@@ -188,9 +188,9 @@ class VideoDiTo(nn.Module):
             noisy_z = z * (1. - tau_exp) + tau_exp * eps_z
             pred = self.decoder(noisy_x, noisy_z, ts)
         loss = F.mse_loss(pred, target)
-        if self.cfm_weight > 0:
-            shuffled_target = torch.cat([target[1:], target[:1]], dim = 0) # Shift target by 1 on batch dim
-            cfm_loss = -1 * F.mse_loss(pred, shuffled_target)
-            loss = loss + self.cfm_weight * cfm_loss
+        #if self.cfm_weight > 0:
+        #    shuffled_target = torch.cat([target[1:], target[:1]], dim = 0) # Shift target by 1 on batch dim
+        #    cfm_loss = -1 * F.mse_loss(pred, shuffled_target)
+        #    loss = loss + self.cfm_weight * cfm_loss
 
         return loss, z_original

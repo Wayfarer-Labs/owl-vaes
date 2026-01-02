@@ -14,6 +14,7 @@ from ..utils import int_to_tuple
 
 torch.backends.cuda.enable_flash_sdp(enabled=True)
 flex_attention = torch.compile(flex_attention)
+create_block_mask = torch.compile(create_block_mask)
 
 from einops._torch_specific import allow_ops_in_compiled_graph
 allow_ops_in_compiled_graph()
@@ -109,8 +110,8 @@ def get_attn_mask(
     
     return create_block_mask(
         can_attend_to,
-        B=batch_size,
-        H=config.n_heads,
+        B=None,
+        H=None,
         Q_LEN=max_q_len,
         KV_LEN=max_kv_len,
         device=device,
