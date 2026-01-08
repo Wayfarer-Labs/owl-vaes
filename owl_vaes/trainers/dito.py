@@ -22,6 +22,7 @@ from ..utils.logging import LogHelper, to_wandb, to_wandb_grayscale
 from .base import BaseTrainer
 from ..configs import Config
 from ..sampling import flow_sample, x0_sample
+from ..losses.outlier import outlier_penalty_loss
 
 class DiToTrainer(BaseTrainer):
     """
@@ -89,6 +90,11 @@ class DiToTrainer(BaseTrainer):
     def train(self):
         torch.cuda.set_device(self.local_rank)
 
+        if hasattr(self.train_cfg, 'loss_weights'):
+            opl_weight = self.train_cfg.loss_weights.get('opl', 0)
+        else:
+            opl_weight = 0
+
         # Prepare model, lpips, ema
         self.model = self.model.to(self.device).train()
         if self.world_size > 1:
@@ -119,6 +125,7 @@ class DiToTrainer(BaseTrainer):
         timer = Timer()
         timer.reset()
         metrics = LogHelper()
+        if self.rank == 0: wandb.watch(self.model.module, log = 'all')
 
         # Dataset setup
         loader = get_loader(self.train_cfg.data_id, self.train_cfg.batch_size, rank=self.rank, world_size=self.world_size, **self.train_cfg.data_kwargs)
@@ -132,9 +139,14 @@ class DiToTrainer(BaseTrainer):
 
                 with ctx:
                     diff_loss, z = self.model(batch, proxy = proxy_batch)
+                    total_loss += diff_loss
 
+                    if opl_weight > 0.0:
+                        opl_loss = outlier_penalty_loss(z) * opl_weight
+                        total_loss += opl_loss
+                    
                 metrics.log('diff_loss', diff_loss)
-                total_loss += diff_loss
+                metrics.log('opl_loss', opl_loss)
                 self.scaler.scale(total_loss).backward()
 
                 with torch.no_grad():
@@ -146,9 +158,8 @@ class DiToTrainer(BaseTrainer):
                     })
 
                 # Updates
-                if self.train_cfg.opt.lower() != "muon":
-                    self.scaler.unscale_(self.opt)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.scaler.unscale_(self.opt)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
 
                 self.scaler.step(self.opt)
                 self.opt.zero_grad(set_to_none=True)

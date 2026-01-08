@@ -9,6 +9,10 @@ class MLP(nn.Module):
         self.fc2 = nn.Linear(4 * config.d_model, config.d_model)
         self.dropout = nn.Dropout(getattr(config, "dropout", 0))
 
+        # Init 2nd fc to 0
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
     def forward(self, x):
         x = self.fc1(x)
         x = F.silu(x)
