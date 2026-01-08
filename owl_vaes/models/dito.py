@@ -5,11 +5,124 @@ from torch import nn
 from copy import deepcopy
 import einops as eo
 
-from .dcae import Encoder
+from .dcae import Encoder, latent_ln
 from ..nn.dit import DiT, FinalLayer
 from ..nn.embeddings import TimestepEmbedding
-from ..nn.attn import get_attn_mask
+from ..nn.attn import get_attn_mask, StackedTransformer
 from ..utils import int_to_tuple
+from ..nn.resnet import WeightNormConv2d
+
+class ResidualDownsample(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        self.config = config
+
+        sample_size = (config.sample_size[0], config.sample_size[1])
+        patch_size = (config.patch_size[0], config.patch_size[1])
+        h,w = sample_size
+        ph,pw = patch_size
+        self.nph, self.npw = h//ph, w//pw
+
+        self.proj = WeightNormConv2d(config.d_model, 4*config.d_model, 2, 2, 0, bias=False)
+    
+    def forward(self, x):
+        x = eo.rearrange(x, 'b (nph npw) d -> b d nph npw', nph = self.nph, npw = self.npw)
+        x = self.proj(x) # b 4d nph/2 npw/2
+        x = F.pixel_shuffle(x, 2).contiguous() # b d nph npw
+        x = eo.rearrange(x, 'b d nph npw -> b (nph npw) d')
+        return x
+
+class SwegEncoder(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        config.rope_impl = 'image'
+        size = config.sample_size
+        patch_size = config.patch_size
+        if isinstance(patch_size, int):
+            patch_size = [patch_size, patch_size]
+        n_tokens = size[0] // patch_size[0] * size[1] // patch_size[1]
+
+        self.proj_in = nn.Linear(patch_size[0] * patch_size[1] * config.channels, config.d_model, bias = False)
+        self.proj_out = nn.Linear(config.d_model, patch_size[0] * patch_size[1] * config.channels, bias = False)
+
+        blocks_per_stage = config.encoder_blocks_per_stage
+
+        blocks = []
+        residuals = []
+
+        for block_count in blocks_per_stage:
+            blocks.append(StackedTransformer(config, n_layers = block_count))
+            residuals.append(ResidualDownsample(config))
+
+        self.blocks = nn.ModuleList(blocks)
+        self.residuals = nn.ModuleList(residuals)
+        
+        self.config = config
+
+        self.p_y, self.p_x = patch_size
+        self.n_p_y = config.sample_size[0] // self.p_y
+        self.n_p_x = config.sample_size[1] // self.p_x
+
+        self.z = nn.Parameter(0.02 * torch.randn(config.latent_channels, config.latent_size, config.latent_size))
+        self.latent_shape = (config.latent_size, config.latent_size)
+
+    def forward(self, x, attn_mask = None):
+        # x is [b,c,h,w]
+        # ts is [b,] in [0,1]
+    
+        if attn_mask is None:
+            # z is interpolated and concatenated channel-wise, so no extra tokens
+            max_q = self.n_p_y * self.n_p_x
+            max_kv = max_q
+
+            attn_mask = get_attn_mask(
+                self.config,
+                batch_size = x.shape[0],
+                device = x.device,
+                max_q_len = max_q,
+                max_kv_len = max_kv,
+                kernel_size = int_to_tuple(getattr(self.config, "kernel", None))
+            )
+
+        # Convert from image format [b,c,h,w] to patches [b,n_patches,patch_size*patch_size*c]
+        z = F.interpolate(self.z.unsqueeze(0).repeat(x.shape[0], 1, 1, 1), size=x.shape[-2:], mode='bilinear', align_corners=False)
+        orig_c = x.shape[1]
+        x = torch.cat([x, z], dim=1)
+
+        x = eo.rearrange(
+            x,
+            'b c (n_p_h p_h) (n_p_w p_w) -> b (n_p_h n_p_w) (p_h p_w c)',
+            p_h = self.p_y,
+            p_w = self.p_x
+        )
+
+        x = self.proj_in(x) # -> [b,n,d]
+        res = x.clone()
+        
+        for block, residual in zip(self.blocks, self.residuals):
+            x = block(x, attn_mask = attn_mask) + residual(x)
+        #for block in self.blocks:
+        #    x = block(x, attn_mask = attn_mask)
+
+        x = self.proj_out(x)
+
+        x = eo.rearrange(
+            x,
+            'b (n_p_h n_p_w) (p_h p_w c) -> b c (n_p_h p_h) (n_p_w p_w)',
+            n_p_h = self.n_p_y,
+            n_p_w = self.n_p_x,
+            p_h = self.p_y,
+            p_w = self.p_x
+        )
+
+        z_final = x[:,orig_c:]
+
+        z_final = F.interpolate(z_final, size=self.latent_shape, mode='bilinear', align_corners=False)
+        z_final = latent_ln(z_final)
+
+        return z_final
 
 class DiTODecoder(nn.Module):
     def __init__(self, config):
@@ -90,10 +203,16 @@ class DiTo(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        config.skip_logvar = True
-        config.normalize_mu = True
-        config.clamp_mu = False
-        self.encoder = Encoder(config)
+        encoder_config = deepcopy(config)
+
+        encoder_config.skip_logvar = True
+        encoder_config.normalize_mu = True
+        encoder_config.clamp_mu = False
+        encoder_config.kernel = getattr(config, "encoder_kernel", None)
+        encoder_config.channels = config.latent_channels + config.channels
+        
+        #self.encoder = Encoder(encoder_config)
+        self.encoder = SwegEncoder(encoder_config)
 
         proxy_channels = getattr(config, "proxy_channels", config.channels)
         proxy_sample_size = getattr(config, "proxy_sample_size", config.sample_size)
@@ -101,6 +220,7 @@ class DiTo(nn.Module):
         decoder_config = deepcopy(config)
         decoder_config.channels = proxy_channels + config.latent_channels
         decoder_config.sample_size = proxy_sample_size
+        decoder_config.kernel = getattr(config, "decoder_kernel", None)
 
         self.decoder = DiTODecoder(decoder_config)
 
