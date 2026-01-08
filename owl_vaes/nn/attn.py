@@ -180,11 +180,13 @@ class Transformer(nn.Module):
         return x
 
 class StackedTransformer(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, n_layers = None):
         super().__init__()
 
+        if n_layers is None:
+            n_layers = config.n_layers
         blocks = []
-        for i in range(config.n_layers):
+        for i in range(n_layers):
             blocks.append(Transformer(config))
             blocks[i].attn.layer_ind = i
         self.blocks = nn.ModuleList(blocks)
