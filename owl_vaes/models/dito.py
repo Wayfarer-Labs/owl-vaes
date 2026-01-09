@@ -65,7 +65,7 @@ class SwegEncoder(nn.Module):
         self.n_p_y = config.sample_size[0] // self.p_y
         self.n_p_x = config.sample_size[1] // self.p_x
 
-        self.z = nn.Parameter(0.02 * torch.randn(config.latent_channels, config.latent_size, config.latent_size))
+        self.z = nn.Parameter(torch.randn(config.latent_channels, config.latent_size, config.latent_size))
         self.latent_shape = (config.latent_size, config.latent_size)
 
     def forward(self, x, attn_mask = None):
